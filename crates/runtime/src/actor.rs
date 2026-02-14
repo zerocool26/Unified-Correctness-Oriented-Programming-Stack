@@ -12,6 +12,13 @@ pub enum Target {
 pub struct Outgoing {
     pub target: Target,
     pub payload: Value,
+    pub delay_steps: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct LogEmission {
+    pub service: String,
+    pub text: String,
 }
 
 pub struct Actor {
@@ -24,6 +31,7 @@ pub struct Actor {
 pub struct ActorContext {
     pub self_node: NodeId,
     pub outbox: Vec<Outgoing>,
+    pub logs: Vec<LogEmission>,
 }
 
 impl ActorContext {
@@ -31,18 +39,46 @@ impl ActorContext {
         Self {
             self_node,
             outbox: vec![],
+            logs: vec![],
         }
     }
 
+    pub fn log(&mut self, service: impl Into<String>, text: impl Into<String>) {
+        self.logs.push(LogEmission {
+            service: service.into(),
+            text: text.into(),
+        });
+    }
+
     pub fn send_local_service(&mut self, service: impl Into<String>, payload: Value) {
+        self.send_local_service_after(0, service, payload);
+    }
+
+    pub fn send_local_service_after(
+        &mut self,
+        delay_steps: u64,
+        service: impl Into<String>,
+        payload: Value,
+    ) {
         self.outbox.push(Outgoing {
             target: Target::LocalService(service.into()),
             payload,
+            delay_steps,
         });
     }
 
     pub fn send_remote_service(
         &mut self,
+        node: NodeId,
+        service: impl Into<String>,
+        payload: Value,
+    ) {
+        self.send_remote_service_after(0, node, service, payload);
+    }
+
+    pub fn send_remote_service_after(
+        &mut self,
+        delay_steps: u64,
         node: NodeId,
         service: impl Into<String>,
         payload: Value,
@@ -53,6 +89,7 @@ impl ActorContext {
                 service: service.into(),
             },
             payload,
+            delay_steps,
         });
     }
 }

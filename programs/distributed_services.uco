@@ -3,15 +3,23 @@
 service Gateway
 state sent = 0
 on start
+  effects state_write state_read log send_remote timer_local timer_remote
   inc sent
   if sent == 1 log "first broadcast from $self_node"
   send remote peers Echo hello "hello #$state.sent from $self_node ($text)"
+  timer 2 Gateway audit "audit from $self_node sent=$state.sent"
+  timer 3 remote peers Echo hello "delayed hello #$state.sent from $self_node"
 on echo_reply
-  log "got echo reply from $from_node: $text (sent=$state.sent)"
+  effects log
+  log "got echo reply from $from_node: $text (sent=$state.sent root=$prov.origin_msg hops=$prov.hops)"
+on audit
+  effects log
+  log "timer fired: $text"
 
 service Echo
 state seen = 0
 on hello
+  effects state_write log send_remote
   inc seen
-  log "echo received #$state.seen from $from_node: $text"
+  log "echo received #$state.seen from $from_node: $text (origin=$prov.origin_service/$prov.origin_msg hops=$prov.hops)"
   send remote sender Gateway echo_reply "echo#$state.seen($text)"

@@ -161,6 +161,9 @@ function Invoke-FaultScenario {
 
     Write-Host "[$Name] replay check..."
     & $runtimeExe --replay --node-id $Node2Id --trace $node2Trace --steps 240 | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        throw "[$Name] replay check failed for $node2Trace"
+    }
 
     Write-Host "[$Name] trace summary:"
     & $toolExe $node2Trace | Out-Host

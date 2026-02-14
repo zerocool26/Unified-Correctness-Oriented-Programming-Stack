@@ -12,6 +12,17 @@ pub enum FaultAction {
     Reorder { window: u64 },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum EffectKind {
+    Log,
+    StateRead,
+    StateWrite,
+    SendLocal,
+    SendRemote,
+    TimerLocal,
+    TimerRemote,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum EventKind {
     Spawn {
@@ -32,6 +43,7 @@ pub enum EventKind {
     },
     TimerFired {
         node: NodeId,
+        from: ActorId,
         timer_id: Uuid,
     },
     NetRecv {
@@ -47,6 +59,21 @@ pub enum EventKind {
         from: ActorId,
         msg_id: MsgId,
         payload: serde_json::Value,
+    },
+    Log {
+        node: NodeId,
+        from: ActorId,
+        service: String,
+        text: String,
+    },
+    EffectObserved {
+        node: NodeId,
+        actor: ActorId,
+        service: String,
+        msg_type: String,
+        msg_id: MsgId,
+        declared: Vec<EffectKind>,
+        observed: Vec<EffectKind>,
     },
     FaultInjected {
         node: NodeId,

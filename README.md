@@ -50,9 +50,13 @@ Syntax:
 - `service <Name>`
 - `state <name> = <int>`
 - `on <MessageType>`
+- `effects <effect...>` where effects are: `log`, `state_read`, `state_write`, `send_local`, `send_remote`, `timer_local`, `timer_remote`
 - `log "<template>"`
 - `set <state> <int>`
 - `inc <state> [by]`
+- `timer <steps> <Service> <MessageType> "<template>"`
+- `timer <steps> local <Service> <MessageType> "<template>"`
+- `timer <steps> remote <peers|sender|node:<uuid>> <Service> <MessageType> "<template>"`
 - `if <state> == <int> <action...>`
 - `send local <Service> <MessageType> "<template>"`
 - `send remote peers <Service> <MessageType> "<template>"`
@@ -64,6 +68,8 @@ Template variables:
 - `$from_node`, `$from_service`
 - `$type`, `$text`
 - `$state.<name>` for declared per-service state values
+- `$prov.origin_node`, `$prov.origin_service`
+- `$prov.origin_msg`, `$prov.parent_node`, `$prov.parent_msg`, `$prov.hops`
 
 ## Quick Start (Single Node)
 
@@ -92,6 +98,18 @@ cargo run -p tool -- verify trace.jsonl
 ```
 
 `verify` exits non-zero on invariant violations (sequence/seed consistency and message lifecycle checks).
+
+Inspect provenance lineage summary:
+
+```bash
+cargo run -p tool -- lineage trace.jsonl
+```
+
+Trace one message lineage path (`from_node` + `msg_id`):
+
+```bash
+cargo run -p tool -- lineage-path trace.jsonl 00000000-0000-0000-0000-000000000302 00000000-0000-0000-0000-000000000304
+```
 
 ## Lean Kernel
 
@@ -171,9 +189,14 @@ If Lean is installed (`lake` on `PATH`), the local CI script also builds `semant
 - Determinism contract: external nondeterminism is mediated through runtime trace events (`Deliver`, `NetRecv`, `NetSend`).
 - Failure injection decisions are traced via `FaultInjected` events and therefore replay-safe.
 - Runtime boot actor creation is traced via `Spawn` events.
+- Timer actions are traced via `TimerFired` and replay-checked for deterministic firing order.
+- Service `log` side effects are traced via `Log` events and replay-checked in-order.
+- Every `Deliver` is followed by `EffectObserved`, recording declared vs observed handler effects for that delivery.
 - Replay mode consumes recorded events and re-injects `NetRecv` before following `Deliver`.
 - Replay mode is strict: it fails if trace deliveries remain after `--steps` or if EOF leaves undelivered inbox messages.
-- Replay also verifies emitted side effects (`Send`/`NetSend`) against the trace in-order.
+- Replay also verifies emitted side effects (`EffectObserved`/`Send`/`NetSend`/`Log`) against the trace in-order.
+- `tool verify` enforces that observed effects are a subset of declared effects and that effect evidence appears after each delivery.
+- Runtime payloads carry provenance lineage (origin/parent/hops), and `tool verify` checks lineage consistency.
 - Runtime behavior is executed from the parsed service language, not hardcoded Rust handlers.
 
 ## Branch Protection

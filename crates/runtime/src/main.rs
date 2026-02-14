@@ -6,13 +6,13 @@ mod trace;
 
 use actor::{Actor, ActorContext, ActorSystem, Target};
 use anyhow::{Context, Result};
-use event::{EventKind, FaultAction, TraceEvent};
-use lang::{parse_module, ActionDecl, RemoteTarget};
+use event::{EffectKind as RuntimeEffectKind, EventKind, FaultAction, TraceEvent};
+use lang::{parse_module, ActionDecl, HandlerEffect, RemoteTarget};
 use net::WireEnvelope;
 use scheduler::{choose_next_deterministic, PendingDelivery};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Duration;
@@ -57,23 +57,53 @@ struct Config {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct Provenance {
+    origin_node: String,
+    origin_service: String,
+    origin_msg_id: String,
+    parent_node: String,
+    parent_msg_id: String,
+    hops: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct RuntimeMessage {
     #[serde(rename = "type")]
     msg_type: String,
     from_node: String,
     from_service: String,
     text: String,
+    #[serde(default)]
+    provenance: Option<Provenance>,
 }
 
 #[derive(Debug, Clone)]
 struct Program {
     services: Vec<String>,
     service_initial_state: HashMap<String, HashMap<String, i64>>,
-    handlers: HashMap<(String, String), Vec<ActionDecl>>,
+    handlers: HashMap<(String, String), HandlerPlan>,
+}
+
+#[derive(Debug, Clone)]
+struct HandlerPlan {
+    actions: Vec<ActionDecl>,
+    declared_effects: Option<Vec<HandlerEffect>>,
 }
 
 fn next_deterministic_msg_id(node_id: Uuid, counter: &mut u64) -> Uuid {
     let id = Uuid::from_u128(node_id.as_u128().wrapping_add(*counter as u128));
+    *counter = counter.saturating_add(1);
+    id
+}
+
+fn next_deterministic_timer_id(node_id: Uuid, counter: &mut u64) -> Uuid {
+    let timer_offset = 1_u128 << 96;
+    let id = Uuid::from_u128(
+        node_id
+            .as_u128()
+            .wrapping_add(timer_offset)
+            .wrapping_add(*counter as u128),
+    );
     *counter = counter.saturating_add(1);
     id
 }
@@ -244,7 +274,7 @@ fn load_program(path: &str) -> Result<Program> {
     let mut services = Vec::new();
     let mut seen = HashSet::<String>::new();
     let mut service_initial_state = HashMap::<String, HashMap<String, i64>>::new();
-    let mut handlers = HashMap::<(String, String), Vec<ActionDecl>>::new();
+    let mut handlers = HashMap::<(String, String), HandlerPlan>::new();
 
     for service in module.services {
         if seen.contains(&service.name) {
@@ -267,17 +297,43 @@ fn load_program(path: &str) -> Result<Program> {
 
         for handler in service.handlers {
             let key = (service.name.clone(), handler.on.clone());
-            handlers.entry(key).or_default().extend(handler.actions);
+            let plan = handlers.entry(key).or_insert_with(|| HandlerPlan {
+                actions: Vec::new(),
+                declared_effects: None,
+            });
+            if let Some(declared) = handler.effects {
+                if plan.declared_effects.is_some() {
+                    anyhow::bail!(
+                        "service `{}` handler `on {}` declares effects more than once",
+                        service.name,
+                        handler.on
+                    );
+                }
+                plan.declared_effects = Some(declared);
+            }
+            plan.actions.extend(handler.actions);
         }
     }
 
     let service_names: HashSet<String> = services.iter().cloned().collect();
-    for ((service_name, msg_type), actions) in &handlers {
+    for ((service_name, msg_type), plan) in &handlers {
         let state = service_initial_state
             .get(service_name)
             .with_context(|| format!("internal error: missing state for `{service_name}`"))?;
-        for action in actions {
+        for action in &plan.actions {
             validate_action(action, service_name, msg_type, state, &service_names)?;
+        }
+
+        if let Some(declared) = plan.declared_effects.as_ref() {
+            let inferred = infer_effects(&plan.actions);
+            let declared_set: BTreeSet<HandlerEffect> = declared.iter().copied().collect();
+            if inferred != declared_set {
+                anyhow::bail!(
+                    "service `{service_name}` handler `on {msg_type}` effect contract mismatch: declared [{}], inferred [{}]",
+                    format_effects(&declared_set),
+                    format_effects(&inferred)
+                );
+            }
         }
     }
 
@@ -310,6 +366,14 @@ fn validate_action(
             service: target_service,
             ..
         }
+        | ActionDecl::TimerLocal {
+            service: target_service,
+            ..
+        }
+        | ActionDecl::TimerRemote {
+            service: target_service,
+            ..
+        }
         | ActionDecl::SendRemote {
             service: target_service,
             ..
@@ -319,6 +383,14 @@ fn validate_action(
                     "service `{service_name}` handler `on {msg_type}` sends to unknown service `{target_service}`"
                 );
             }
+        }
+    }
+
+    if let ActionDecl::TimerLocal { steps, .. } | ActionDecl::TimerRemote { steps, .. } = action {
+        if *steps == 0 {
+            anyhow::bail!(
+                "service `{service_name}` handler `on {msg_type}` has timer with zero steps"
+            );
         }
     }
 
@@ -338,7 +410,86 @@ fn validate_action(
         })?;
     }
 
+    if let ActionDecl::TimerRemote {
+        target: RemoteTarget::Node(raw),
+        ..
+    } = action
+    {
+        Uuid::parse_str(raw).with_context(|| {
+            format!(
+                "service `{service_name}` handler `on {msg_type}` has invalid timer node target `{raw}`"
+            )
+        })?;
+    }
+
     Ok(())
+}
+
+fn infer_effects(actions: &[ActionDecl]) -> BTreeSet<HandlerEffect> {
+    let mut out = BTreeSet::new();
+    for action in actions {
+        infer_action_effects(action, &mut out);
+    }
+    out
+}
+
+fn infer_action_effects(action: &ActionDecl, out: &mut BTreeSet<HandlerEffect>) {
+    match action {
+        ActionDecl::Log { .. } => {
+            out.insert(HandlerEffect::Log);
+        }
+        ActionDecl::SetState { .. } | ActionDecl::IncState { .. } => {
+            out.insert(HandlerEffect::StateWrite);
+        }
+        ActionDecl::TimerLocal { .. } => {
+            out.insert(HandlerEffect::TimerLocal);
+        }
+        ActionDecl::TimerRemote { .. } => {
+            out.insert(HandlerEffect::TimerRemote);
+        }
+        ActionDecl::SendLocal { .. } => {
+            out.insert(HandlerEffect::SendLocal);
+        }
+        ActionDecl::SendRemote { .. } => {
+            out.insert(HandlerEffect::SendRemote);
+        }
+        ActionDecl::IfStateEq { then_action, .. } => {
+            out.insert(HandlerEffect::StateRead);
+            infer_action_effects(then_action, out);
+        }
+    }
+}
+
+fn format_effects(effects: &BTreeSet<HandlerEffect>) -> String {
+    effects
+        .iter()
+        .map(|e| match e {
+            HandlerEffect::Log => "log",
+            HandlerEffect::StateRead => "state_read",
+            HandlerEffect::StateWrite => "state_write",
+            HandlerEffect::SendLocal => "send_local",
+            HandlerEffect::SendRemote => "send_remote",
+            HandlerEffect::TimerLocal => "timer_local",
+            HandlerEffect::TimerRemote => "timer_remote",
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn to_runtime_effect(effect: HandlerEffect) -> RuntimeEffectKind {
+    match effect {
+        HandlerEffect::Log => RuntimeEffectKind::Log,
+        HandlerEffect::StateRead => RuntimeEffectKind::StateRead,
+        HandlerEffect::StateWrite => RuntimeEffectKind::StateWrite,
+        HandlerEffect::SendLocal => RuntimeEffectKind::SendLocal,
+        HandlerEffect::SendRemote => RuntimeEffectKind::SendRemote,
+        HandlerEffect::TimerLocal => RuntimeEffectKind::TimerLocal,
+        HandlerEffect::TimerRemote => RuntimeEffectKind::TimerRemote,
+    }
+}
+
+fn effect_vec(effects: &BTreeSet<HandlerEffect>) -> Vec<RuntimeEffectKind> {
+    effects.iter().copied().map(to_runtime_effect).collect()
 }
 
 fn actor_id_for_service(service: &str) -> Uuid {
@@ -383,6 +534,45 @@ fn decode_msg(value: Value) -> Result<RuntimeMessage> {
     serde_json::from_value(value).context("decode runtime message payload")
 }
 
+fn next_outbound_provenance(incoming: &RuntimeMessage, incoming_msg_id: Uuid) -> Provenance {
+    if let Some(prev) = incoming.provenance.as_ref() {
+        return Provenance {
+            origin_node: prev.origin_node.clone(),
+            origin_service: prev.origin_service.clone(),
+            origin_msg_id: prev.origin_msg_id.clone(),
+            parent_node: incoming.from_node.clone(),
+            parent_msg_id: incoming_msg_id.to_string(),
+            hops: prev.hops.saturating_add(1),
+        };
+    }
+
+    Provenance {
+        origin_node: incoming.from_node.clone(),
+        origin_service: incoming.from_service.clone(),
+        origin_msg_id: incoming_msg_id.to_string(),
+        parent_node: incoming.from_node.clone(),
+        parent_msg_id: incoming_msg_id.to_string(),
+        hops: 1,
+    }
+}
+
+fn build_outbound_message(
+    msg_type: &str,
+    text: String,
+    self_node: Uuid,
+    service: &str,
+    incoming: &RuntimeMessage,
+    incoming_msg_id: Uuid,
+) -> RuntimeMessage {
+    RuntimeMessage {
+        msg_type: msg_type.to_string(),
+        from_node: self_node.to_string(),
+        from_service: service.to_string(),
+        text,
+        provenance: Some(next_outbound_provenance(incoming, incoming_msg_id)),
+    }
+}
+
 fn render_template(
     template: &str,
     self_node: Uuid,
@@ -397,6 +587,31 @@ fn render_template(
     out = out.replace("$from_service", &incoming.from_service);
     out = out.replace("$text", &incoming.text);
     out = out.replace("$type", &incoming.msg_type);
+    let (
+        prov_origin_node,
+        prov_origin_service,
+        prov_origin_msg,
+        prov_parent_node,
+        prov_parent_msg,
+        prov_hops,
+    ) = if let Some(prov) = incoming.provenance.as_ref() {
+        (
+            prov.origin_node.as_str(),
+            prov.origin_service.as_str(),
+            prov.origin_msg_id.as_str(),
+            prov.parent_node.as_str(),
+            prov.parent_msg_id.as_str(),
+            prov.hops.to_string(),
+        )
+    } else {
+        ("", "", "", "", "", String::new())
+    };
+    out = out.replace("$prov.origin_node", prov_origin_node);
+    out = out.replace("$prov.origin_service", prov_origin_service);
+    out = out.replace("$prov.origin_msg", prov_origin_msg);
+    out = out.replace("$prov.parent_node", prov_parent_node);
+    out = out.replace("$prov.parent_msg", prov_parent_msg);
+    out = out.replace("$prov.hops", &prov_hops);
 
     let mut keys: Vec<&String> = state.keys().collect();
     keys.sort_unstable();
@@ -416,46 +631,148 @@ fn sorted_peer_ids(peers: &HashMap<Uuid, String>) -> Vec<Uuid> {
     ids
 }
 
+fn dispatch_outgoing(
+    cfg: &Config,
+    sys: &mut ActorSystem,
+    service_to_actor: &HashMap<String, Uuid>,
+    from_actor: Uuid,
+    target: Target,
+    payload: Value,
+    msg_counter: &mut u64,
+    mode: Mode,
+) -> Result<EventKind> {
+    match target {
+        Target::LocalService(service_name) => {
+            let to_actor_id = service_to_actor
+                .get(&service_name)
+                .copied()
+                .with_context(|| format!("unknown local target service `{service_name}`"))?;
+            let msg_id = next_deterministic_msg_id(cfg.node_id, msg_counter);
+            let to_actor = sys
+                .actors
+                .get_mut(&to_actor_id)
+                .context("actor missing for known service mapping")?;
+            to_actor.inbox.push_back((msg_id, payload.clone()));
+
+            Ok(EventKind::Send {
+                from: from_actor,
+                to: to_actor_id,
+                msg_id,
+                payload,
+            })
+        }
+        Target::RemoteService {
+            node,
+            service: service_name,
+        } => {
+            let to_actor_id = service_to_actor
+                .get(&service_name)
+                .copied()
+                .with_context(|| format!("unknown remote target service `{service_name}`"))?;
+            let msg_id = next_deterministic_msg_id(cfg.node_id, msg_counter);
+            let envelope = WireEnvelope {
+                from_node: cfg.node_id,
+                to_node: node,
+                to_actor: to_actor_id,
+                msg_id,
+                payload: payload.clone(),
+            };
+
+            if matches!(mode, Mode::Record) {
+                if let Some(addr) = cfg.peers.get(&node) {
+                    if let Err(err) = net::send_envelope(addr, &envelope) {
+                        eprintln!(
+                            "[{}] send to peer {} ({}) failed: {}",
+                            cfg.node_id, node, addr, err
+                        );
+                    }
+                } else {
+                    eprintln!(
+                        "[{}] no peer address configured for node {}",
+                        cfg.node_id, node
+                    );
+                }
+            }
+
+            Ok(EventKind::NetSend {
+                node: cfg.node_id,
+                to_node: node,
+                from: from_actor,
+                msg_id,
+                payload,
+            })
+        }
+    }
+}
+
 fn execute_actions(
     program: &Program,
     service: &str,
+    incoming_msg_id: Uuid,
     incoming: &RuntimeMessage,
     peers: &HashMap<Uuid, String>,
     state: &mut HashMap<String, i64>,
     ctx: &mut ActorContext,
-) -> Result<()> {
+) -> Result<ExecutedEffects> {
     let key = (service.to_string(), incoming.msg_type.clone());
-    let Some(actions) = program.handlers.get(&key) else {
-        return Ok(());
+    let Some(plan) = program.handlers.get(&key) else {
+        return Ok(ExecutedEffects::default());
     };
 
-    for action in actions {
-        execute_action(action, service, incoming, peers, state, ctx)?;
+    let declared = plan
+        .declared_effects
+        .as_ref()
+        .map(|declared| declared.iter().copied().collect())
+        .unwrap_or_else(|| infer_effects(&plan.actions));
+    let mut observed = BTreeSet::new();
+
+    for action in &plan.actions {
+        execute_action(
+            action,
+            service,
+            incoming_msg_id,
+            incoming,
+            peers,
+            state,
+            ctx,
+            &mut observed,
+        )?;
     }
 
-    Ok(())
+    Ok(ExecutedEffects { declared, observed })
+}
+
+#[derive(Debug, Default)]
+struct ExecutedEffects {
+    declared: BTreeSet<HandlerEffect>,
+    observed: BTreeSet<HandlerEffect>,
 }
 
 fn execute_action(
     action: &ActionDecl,
     service: &str,
+    incoming_msg_id: Uuid,
     incoming: &RuntimeMessage,
     peers: &HashMap<Uuid, String>,
     state: &mut HashMap<String, i64>,
     ctx: &mut ActorContext,
+    observed_effects: &mut BTreeSet<HandlerEffect>,
 ) -> Result<()> {
     match action {
         ActionDecl::Log { template } => {
+            observed_effects.insert(HandlerEffect::Log);
             let msg = render_template(template, ctx.self_node, service, incoming, state);
-            println!("[{}] {}: {}", ctx.self_node, service, msg);
+            ctx.log(service.to_string(), msg);
         }
         ActionDecl::SetState { key, value } => {
+            observed_effects.insert(HandlerEffect::StateWrite);
             let slot = state.get_mut(key).with_context(|| {
                 format!("service `{service}` attempted set on unknown state `{key}`")
             })?;
             *slot = *value;
         }
         ActionDecl::IncState { key, by } => {
+            observed_effects.insert(HandlerEffect::StateWrite);
             let slot = state.get_mut(key).with_context(|| {
                 format!("service `{service}` attempted inc on unknown state `{key}`")
             })?;
@@ -463,18 +780,126 @@ fn execute_action(
                 .checked_add(*by)
                 .with_context(|| format!("service `{service}` state overflow for `{key}`"))?;
         }
+        ActionDecl::TimerLocal {
+            steps,
+            service: target_service,
+            message,
+            template,
+        } => {
+            observed_effects.insert(HandlerEffect::TimerLocal);
+            let text = render_template(template, ctx.self_node, service, incoming, state);
+            let outbound = build_outbound_message(
+                message,
+                text,
+                ctx.self_node,
+                service,
+                incoming,
+                incoming_msg_id,
+            );
+            ctx.send_local_service_after(*steps, target_service.clone(), encode_msg(&outbound));
+        }
+        ActionDecl::TimerRemote {
+            steps,
+            target,
+            service: target_service,
+            message,
+            template,
+        } => {
+            observed_effects.insert(HandlerEffect::TimerRemote);
+            let text = render_template(template, ctx.self_node, service, incoming, state);
+            let outbound = build_outbound_message(
+                message,
+                text,
+                ctx.self_node,
+                service,
+                incoming,
+                incoming_msg_id,
+            );
+            let payload = encode_msg(&outbound);
+
+            match target {
+                RemoteTarget::Peers => {
+                    let peer_ids = sorted_peer_ids(peers);
+                    if peer_ids.is_empty() {
+                        ctx.send_local_service_after(
+                            *steps,
+                            target_service.clone(),
+                            payload.clone(),
+                        );
+                    } else {
+                        for peer in peer_ids {
+                            if peer == ctx.self_node {
+                                ctx.send_local_service_after(
+                                    *steps,
+                                    target_service.clone(),
+                                    payload.clone(),
+                                );
+                            } else {
+                                ctx.send_remote_service_after(
+                                    *steps,
+                                    peer,
+                                    target_service.clone(),
+                                    payload.clone(),
+                                );
+                            }
+                        }
+                    }
+                }
+                RemoteTarget::Sender => {
+                    let Ok(sender_node) = Uuid::parse_str(&incoming.from_node) else {
+                        eprintln!(
+                            "[{}] {}: invalid sender node `{}`",
+                            ctx.self_node, service, incoming.from_node
+                        );
+                        return Ok(());
+                    };
+                    if sender_node == ctx.self_node {
+                        ctx.send_local_service_after(*steps, target_service.clone(), payload);
+                    } else {
+                        ctx.send_remote_service_after(
+                            *steps,
+                            sender_node,
+                            target_service.clone(),
+                            payload,
+                        );
+                    }
+                }
+                RemoteTarget::Node(raw) => {
+                    let Ok(node) = Uuid::parse_str(raw) else {
+                        eprintln!(
+                            "[{}] {}: invalid remote node `{}`",
+                            ctx.self_node, service, raw
+                        );
+                        return Ok(());
+                    };
+                    if node == ctx.self_node {
+                        ctx.send_local_service_after(*steps, target_service.clone(), payload);
+                    } else {
+                        ctx.send_remote_service_after(
+                            *steps,
+                            node,
+                            target_service.clone(),
+                            payload,
+                        );
+                    }
+                }
+            }
+        }
         ActionDecl::SendLocal {
             service: target_service,
             message,
             template,
         } => {
+            observed_effects.insert(HandlerEffect::SendLocal);
             let text = render_template(template, ctx.self_node, service, incoming, state);
-            let outbound = RuntimeMessage {
-                msg_type: message.clone(),
-                from_node: ctx.self_node.to_string(),
-                from_service: service.to_string(),
+            let outbound = build_outbound_message(
+                message,
                 text,
-            };
+                ctx.self_node,
+                service,
+                incoming,
+                incoming_msg_id,
+            );
             ctx.send_local_service(target_service.clone(), encode_msg(&outbound));
         }
         ActionDecl::SendRemote {
@@ -483,13 +908,16 @@ fn execute_action(
             message,
             template,
         } => {
+            observed_effects.insert(HandlerEffect::SendRemote);
             let text = render_template(template, ctx.self_node, service, incoming, state);
-            let outbound = RuntimeMessage {
-                msg_type: message.clone(),
-                from_node: ctx.self_node.to_string(),
-                from_service: service.to_string(),
+            let outbound = build_outbound_message(
+                message,
                 text,
-            };
+                ctx.self_node,
+                service,
+                incoming,
+                incoming_msg_id,
+            );
             let payload = encode_msg(&outbound);
 
             match target {
@@ -546,11 +974,21 @@ fn execute_action(
             value,
             then_action,
         } => {
+            observed_effects.insert(HandlerEffect::StateRead);
             let current = state.get(key).with_context(|| {
                 format!("service `{service}` attempted if on unknown state `{key}`")
             })?;
             if *current == *value {
-                execute_action(then_action, service, incoming, peers, state, ctx)?;
+                execute_action(
+                    then_action,
+                    service,
+                    incoming_msg_id,
+                    incoming,
+                    peers,
+                    state,
+                    ctx,
+                    observed_effects,
+                )?;
             }
         }
     }
@@ -582,6 +1020,15 @@ fn record_event(
 struct StagedInbound {
     env: WireEnvelope,
     release_step: u64,
+}
+
+#[derive(Debug)]
+struct PendingTimer {
+    due_step: u64,
+    timer_id: Uuid,
+    from_actor: Uuid,
+    target: Target,
+    payload: Value,
 }
 
 struct FaultInjector {
@@ -852,7 +1299,18 @@ fn next_replay_delivery(
                 }
             }
             EventKind::FaultInjected { .. } => {}
-            _ => {}
+            EventKind::Send { .. }
+            | EventKind::NetSend { .. }
+            | EventKind::Spawn { .. }
+            | EventKind::TimerFired { .. }
+            | EventKind::Log { .. }
+            | EventKind::EffectObserved { .. } => {
+                anyhow::bail!(
+                    "[{}] replay encountered unexpected emitted event while awaiting delivery: {:?}",
+                    node_id,
+                    ev.kind
+                );
+            }
         }
     }
 }
@@ -884,7 +1342,10 @@ fn verify_replay_emits(
 
     if let Some(ev) = replay.next()? {
         match ev.kind {
-            EventKind::Send { .. } | EventKind::NetSend { .. } => {
+            EventKind::Send { .. }
+            | EventKind::NetSend { .. }
+            | EventKind::Log { .. }
+            | EventKind::EffectObserved { .. } => {
                 anyhow::bail!(
                     "[{}] replay observed unexpected additional emitted event: {:?}",
                     node_id,
@@ -907,7 +1368,7 @@ fn enqueue_bootstrap(
     writer: &mut Option<TraceWriter>,
     seq: &mut u64,
     seed: u64,
-) -> Result<()> {
+) -> Result<Vec<EventKind>> {
     let entry_actor = service_to_actor
         .get(entry_service)
         .copied()
@@ -918,38 +1379,45 @@ fn enqueue_bootstrap(
     } else {
         1
     };
+    let mut out = Vec::new();
 
     for idx in 0..count {
+        let msg_id = next_deterministic_msg_id(cfg.node_id, msg_counter);
         let msg = RuntimeMessage {
             msg_type: "start".to_string(),
             from_node: cfg.node_id.to_string(),
             from_service: "System".to_string(),
             text: format!("bootstrap #{}", idx + 1),
+            provenance: Some(Provenance {
+                origin_node: cfg.node_id.to_string(),
+                origin_service: "System".to_string(),
+                origin_msg_id: msg_id.to_string(),
+                parent_node: cfg.node_id.to_string(),
+                parent_msg_id: msg_id.to_string(),
+                hops: 0,
+            }),
         };
         let payload = encode_msg(&msg);
-        let msg_id = next_deterministic_msg_id(cfg.node_id, msg_counter);
         sys.actors
             .get_mut(&entry_actor)
             .context("entry actor id missing from actor system")?
             .inbox
             .push_back((msg_id, payload.clone()));
 
+        let ev = EventKind::Send {
+            from: system_actor_id(),
+            to: entry_actor,
+            msg_id,
+            payload,
+        };
+        out.push(ev.clone());
+
         if writer.is_some() {
-            record_event(
-                writer,
-                seq,
-                seed,
-                EventKind::Send {
-                    from: system_actor_id(),
-                    to: entry_actor,
-                    msg_id,
-                    payload,
-                },
-            )?;
+            record_event(writer, seq, seed, ev)?;
         }
     }
 
-    Ok(())
+    Ok(out)
 }
 
 fn main() -> Result<()> {
@@ -971,6 +1439,8 @@ fn main() -> Result<()> {
 
     let mut seq: u64 = 0;
     let mut msg_counter: u64 = 1;
+    let mut timer_counter: u64 = 1;
+    let mut pending_timers: Vec<PendingTimer> = Vec::new();
     let mut writer = match cfg.mode {
         Mode::Record => Some(TraceWriter::create(&cfg.trace_path)?),
         Mode::Replay => None,
@@ -987,36 +1457,30 @@ fn main() -> Result<()> {
         _ => None,
     };
 
+    let mut startup_expected = vec![EventKind::Spawn {
+        node: cfg.node_id,
+        actor: system_actor_id(),
+        service: "System".to_string(),
+    }];
+    for service in &program.services {
+        let actor = service_to_actor
+            .get(service)
+            .copied()
+            .with_context(|| format!("missing actor mapping for service `{service}`"))?;
+        startup_expected.push(EventKind::Spawn {
+            node: cfg.node_id,
+            actor,
+            service: service.clone(),
+        });
+    }
+
     if let Mode::Record = cfg.mode {
-        record_event(
-            &mut writer,
-            &mut seq,
-            seed,
-            EventKind::Spawn {
-                node: cfg.node_id,
-                actor: system_actor_id(),
-                service: "System".to_string(),
-            },
-        )?;
-        for service in &program.services {
-            let actor = service_to_actor
-                .get(service)
-                .copied()
-                .with_context(|| format!("missing actor mapping for service `{service}`"))?;
-            record_event(
-                &mut writer,
-                &mut seq,
-                seed,
-                EventKind::Spawn {
-                    node: cfg.node_id,
-                    actor,
-                    service: service.clone(),
-                },
-            )?;
+        for ev in &startup_expected {
+            record_event(&mut writer, &mut seq, seed, ev.clone())?;
         }
     }
 
-    enqueue_bootstrap(
+    let bootstrap_events = enqueue_bootstrap(
         &mut sys,
         &service_to_actor,
         &entry_service,
@@ -1026,6 +1490,14 @@ fn main() -> Result<()> {
         &mut seq,
         seed,
     )?;
+    startup_expected.extend(bootstrap_events);
+
+    if let Mode::Replay = cfg.mode {
+        let replay = replay
+            .as_mut()
+            .context("internal error: replay mode without replay cursor")?;
+        verify_replay_emits(replay, cfg.node_id, &startup_expected)?;
+    }
 
     let mut replay_exhausted = false;
     for step in 0..cfg.steps {
@@ -1040,6 +1512,54 @@ fn main() -> Result<()> {
                 &mut writer,
                 &mut injector,
             )?;
+        }
+
+        let mut remaining_timers = Vec::with_capacity(pending_timers.len());
+        let mut due_timers = Vec::new();
+        for timer in pending_timers.drain(..) {
+            if timer.due_step <= step {
+                due_timers.push(timer);
+            } else {
+                remaining_timers.push(timer);
+            }
+        }
+        pending_timers = remaining_timers;
+        due_timers.sort_by_key(|t| t.timer_id);
+
+        let mut replay_expected_timers = Vec::new();
+        for timer in due_timers {
+            let timer_ev = EventKind::TimerFired {
+                node: cfg.node_id,
+                from: timer.from_actor,
+                timer_id: timer.timer_id,
+            };
+            match cfg.mode {
+                Mode::Record => record_event(&mut writer, &mut seq, seed, timer_ev)?,
+                Mode::Replay => replay_expected_timers.push(timer_ev),
+            }
+
+            let emit_ev = dispatch_outgoing(
+                &cfg,
+                &mut sys,
+                &service_to_actor,
+                timer.from_actor,
+                timer.target,
+                timer.payload,
+                &mut msg_counter,
+                cfg.mode,
+            )?;
+
+            match cfg.mode {
+                Mode::Record => record_event(&mut writer, &mut seq, seed, emit_ev)?,
+                Mode::Replay => replay_expected_timers.push(emit_ev),
+            }
+        }
+
+        if let Mode::Replay = cfg.mode {
+            let replay = replay
+                .as_mut()
+                .context("internal error: replay mode without replay cursor")?;
+            verify_replay_emits(replay, cfg.node_id, &replay_expected_timers)?;
         }
 
         let mut pending = Vec::new();
@@ -1125,7 +1645,7 @@ fn main() -> Result<()> {
             .with_context(|| format!("decode inbound message for service `{}`", actor_service))?;
 
         let mut ctx = ActorContext::new(cfg.node_id);
-        {
+        let effects = {
             let actor = sys
                 .actors
                 .get_mut(&actor_id)
@@ -1133,97 +1653,71 @@ fn main() -> Result<()> {
             execute_actions(
                 &program,
                 &actor_service,
+                msg_id,
                 &incoming,
                 &cfg.peers,
                 &mut actor.state,
                 &mut ctx,
             )
-            .with_context(|| format!("execute service `{}`", actor_service))?;
-        }
+            .with_context(|| format!("execute service `{}`", actor_service))?
+        };
 
         let mut replay_expected: Vec<EventKind> = Vec::new();
+        let effects_ev = EventKind::EffectObserved {
+            node: cfg.node_id,
+            actor: actor_id,
+            service: actor_service.clone(),
+            msg_type: incoming.msg_type.clone(),
+            msg_id,
+            declared: effect_vec(&effects.declared),
+            observed: effect_vec(&effects.observed),
+        };
+        match cfg.mode {
+            Mode::Record => record_event(&mut writer, &mut seq, seed, effects_ev)?,
+            Mode::Replay => replay_expected.push(effects_ev),
+        }
+
+        for log in ctx.logs {
+            println!("[{}] {}: {}", cfg.node_id, log.service, log.text);
+            let ev = EventKind::Log {
+                node: cfg.node_id,
+                from: actor_id,
+                service: log.service,
+                text: log.text,
+            };
+            match cfg.mode {
+                Mode::Record => record_event(&mut writer, &mut seq, seed, ev)?,
+                Mode::Replay => replay_expected.push(ev),
+            }
+        }
+
         for out in ctx.outbox {
-            match out.target {
-                Target::LocalService(service_name) => {
-                    let Some(to_actor_id) = service_to_actor.get(&service_name).copied() else {
-                        eprintln!(
-                            "[{}] unknown local target service `{}`",
-                            cfg.node_id, service_name
-                        );
-                        continue;
-                    };
+            if out.delay_steps > 0 {
+                let timer_id = next_deterministic_timer_id(cfg.node_id, &mut timer_counter);
+                pending_timers.push(PendingTimer {
+                    due_step: step.saturating_add(out.delay_steps),
+                    timer_id,
+                    from_actor: actor_id,
+                    target: out.target,
+                    payload: out.payload,
+                });
+                continue;
+            }
 
-                    let msg_id = next_deterministic_msg_id(cfg.node_id, &mut msg_counter);
-                    let to_actor = sys
-                        .actors
-                        .get_mut(&to_actor_id)
-                        .context("actor missing for known service mapping")?;
-                    to_actor.inbox.push_back((msg_id, out.payload.clone()));
+            let ev = dispatch_outgoing(
+                &cfg,
+                &mut sys,
+                &service_to_actor,
+                actor_id,
+                out.target,
+                out.payload,
+                &mut msg_counter,
+                cfg.mode,
+            )?;
 
-                    let ev = EventKind::Send {
-                        from: actor_id,
-                        to: to_actor_id,
-                        msg_id,
-                        payload: out.payload,
-                    };
-
-                    match cfg.mode {
-                        Mode::Record => {
-                            record_event(&mut writer, &mut seq, seed, ev)?;
-                        }
-                        Mode::Replay => replay_expected.push(ev),
-                    }
-                }
-                Target::RemoteService {
-                    node,
-                    service: service_name,
-                } => {
-                    let Some(to_actor_id) = service_to_actor.get(&service_name).copied() else {
-                        eprintln!(
-                            "[{}] unknown remote target service `{}`",
-                            cfg.node_id, service_name
-                        );
-                        continue;
-                    };
-
-                    let msg_id = next_deterministic_msg_id(cfg.node_id, &mut msg_counter);
-                    let envelope = WireEnvelope {
-                        from_node: cfg.node_id,
-                        to_node: node,
-                        to_actor: to_actor_id,
-                        msg_id,
-                        payload: out.payload.clone(),
-                    };
-
-                    let ev = EventKind::NetSend {
-                        node: cfg.node_id,
-                        to_node: node,
-                        from: actor_id,
-                        msg_id,
-                        payload: out.payload,
-                    };
-
-                    match cfg.mode {
-                        Mode::Record => {
-                            if let Some(addr) = cfg.peers.get(&node) {
-                                if let Err(err) = net::send_envelope(addr, &envelope) {
-                                    eprintln!(
-                                        "[{}] send to peer {} ({}) failed: {}",
-                                        cfg.node_id, node, addr, err
-                                    );
-                                }
-                            } else {
-                                eprintln!(
-                                    "[{}] no peer address configured for node {}",
-                                    cfg.node_id, node
-                                );
-                            }
-
-                            record_event(&mut writer, &mut seq, seed, ev)?;
-                        }
-                        Mode::Replay => replay_expected.push(ev),
-                    }
-                }
+            match cfg.mode {
+                Mode::Record => record_event(&mut writer, &mut seq, seed, ev)?,
+                Mode::Replay => replay_expected.push(ev),
             }
         }
 
@@ -1239,13 +1733,12 @@ fn main() -> Result<()> {
         let replay = replay
             .as_mut()
             .context("internal error: replay mode without replay cursor")?;
-        if let Some(next) = next_replay_delivery(replay, &mut sys, cfg.node_id)? {
+        if let Some(next) = replay.next()? {
             anyhow::bail!(
-                "[{}] replay stopped early after {} steps (next trace delivery msg_id={} actor={})",
+                "[{}] replay stopped early after {} steps (next trace event: {:?})",
                 cfg.node_id,
                 cfg.steps,
-                next.msg_id,
-                next.to
+                next.kind
             );
         }
         let pending = pending_inbox_messages(&sys);
@@ -1277,12 +1770,19 @@ mod tests {
             from_node: "00000000-0000-0000-0000-000000000000".to_string(),
             from_service: "System".to_string(),
             text: text.to_string(),
+            provenance: None,
         }
     }
 
     fn test_program(actions: Vec<ActionDecl>) -> Program {
         let mut handlers = HashMap::new();
-        handlers.insert(("Gateway".to_string(), "start".to_string()), actions);
+        handlers.insert(
+            ("Gateway".to_string(), "start".to_string()),
+            HandlerPlan {
+                actions,
+                declared_effects: None,
+            },
+        );
         Program {
             services: vec!["Gateway".to_string()],
             service_initial_state: HashMap::new(),
@@ -1317,6 +1817,7 @@ mod tests {
         execute_actions(
             &program,
             "Gateway",
+            Uuid::nil(),
             &test_message("start", "boot"),
             &HashMap::new(),
             &mut state,
@@ -1353,6 +1854,7 @@ mod tests {
         execute_actions(
             &program,
             "Gateway",
+            Uuid::nil(),
             &test_message("start", "boot"),
             &HashMap::new(),
             &mut state,
@@ -1362,5 +1864,150 @@ mod tests {
 
         assert!(ctx.outbox.is_empty());
         assert_eq!(state.get("count"), Some(&1));
+    }
+
+    #[test]
+    fn schedules_timer_local_message() {
+        let program = test_program(vec![ActionDecl::TimerLocal {
+            steps: 2,
+            service: "Gateway".to_string(),
+            message: "tick".to_string(),
+            template: "t=$text".to_string(),
+        }]);
+
+        let mut state = HashMap::new();
+        let mut ctx = ActorContext::new(Uuid::nil());
+        execute_actions(
+            &program,
+            "Gateway",
+            Uuid::nil(),
+            &test_message("start", "boot"),
+            &HashMap::new(),
+            &mut state,
+            &mut ctx,
+        )
+        .expect("execute_actions should succeed");
+
+        assert_eq!(ctx.outbox.len(), 1);
+        assert_eq!(ctx.outbox[0].delay_steps, 2);
+        match &ctx.outbox[0].target {
+            Target::LocalService(svc) => assert_eq!(svc, "Gateway"),
+            other => panic!("unexpected target: {other:?}"),
+        }
+        let payload = decode_msg(ctx.outbox[0].payload.clone()).expect("payload should decode");
+        assert_eq!(payload.msg_type, "tick");
+        assert_eq!(payload.text, "t=boot");
+    }
+
+    #[test]
+    fn schedules_timer_remote_message() {
+        let program = test_program(vec![ActionDecl::TimerRemote {
+            steps: 3,
+            target: RemoteTarget::Peers,
+            service: "Echo".to_string(),
+            message: "hello".to_string(),
+            template: "delayed-$text".to_string(),
+        }]);
+
+        let mut state = HashMap::new();
+        let mut ctx = ActorContext::new(Uuid::nil());
+        execute_actions(
+            &program,
+            "Gateway",
+            Uuid::nil(),
+            &test_message("start", "boot"),
+            &HashMap::new(),
+            &mut state,
+            &mut ctx,
+        )
+        .expect("execute_actions should succeed");
+
+        assert_eq!(ctx.outbox.len(), 1);
+        assert_eq!(ctx.outbox[0].delay_steps, 3);
+        match &ctx.outbox[0].target {
+            Target::LocalService(svc) => assert_eq!(svc, "Echo"),
+            other => panic!("unexpected target: {other:?}"),
+        }
+        let payload = decode_msg(ctx.outbox[0].payload.clone()).expect("payload should decode");
+        assert_eq!(payload.msg_type, "hello");
+        assert_eq!(payload.text, "delayed-boot");
+    }
+
+    #[test]
+    fn propagates_provenance_across_outbound_messages() {
+        let program = test_program(vec![ActionDecl::SendLocal {
+            service: "Gateway".to_string(),
+            message: "echo".to_string(),
+            template: "hop=$prov.hops".to_string(),
+        }]);
+        let incoming_id =
+            Uuid::parse_str("00000000-0000-0000-0000-000000000123").expect("valid uuid");
+        let mut state = HashMap::new();
+        let mut ctx = ActorContext::new(Uuid::nil());
+        let incoming = RuntimeMessage {
+            msg_type: "start".to_string(),
+            from_node: "00000000-0000-0000-0000-000000000001".to_string(),
+            from_service: "System".to_string(),
+            text: "boot".to_string(),
+            provenance: Some(Provenance {
+                origin_node: "00000000-0000-0000-0000-000000000001".to_string(),
+                origin_service: "System".to_string(),
+                origin_msg_id: "00000000-0000-0000-0000-000000000050".to_string(),
+                parent_node: "00000000-0000-0000-0000-000000000001".to_string(),
+                parent_msg_id: "00000000-0000-0000-0000-000000000099".to_string(),
+                hops: 4,
+            }),
+        };
+
+        execute_actions(
+            &program,
+            "Gateway",
+            incoming_id,
+            &incoming,
+            &HashMap::new(),
+            &mut state,
+            &mut ctx,
+        )
+        .expect("execute_actions should succeed");
+
+        let payload = decode_msg(ctx.outbox[0].payload.clone()).expect("payload should decode");
+        let prov = payload
+            .provenance
+            .expect("outbound provenance should exist");
+        assert_eq!(prov.origin_msg_id, "00000000-0000-0000-0000-000000000050");
+        assert_eq!(prov.parent_msg_id, incoming_id.to_string());
+        assert_eq!(prov.hops, 5);
+    }
+
+    #[test]
+    fn renders_provenance_template_tokens() {
+        let state = HashMap::new();
+        let incoming = RuntimeMessage {
+            msg_type: "start".to_string(),
+            from_node: "00000000-0000-0000-0000-000000000001".to_string(),
+            from_service: "System".to_string(),
+            text: "boot".to_string(),
+            provenance: Some(Provenance {
+                origin_node: "00000000-0000-0000-0000-000000000010".to_string(),
+                origin_service: "Gateway".to_string(),
+                origin_msg_id: "00000000-0000-0000-0000-000000000011".to_string(),
+                parent_node: "00000000-0000-0000-0000-000000000010".to_string(),
+                parent_msg_id: "00000000-0000-0000-0000-000000000012".to_string(),
+                hops: 2,
+            }),
+        };
+
+        let rendered = render_template(
+            "origin=$prov.origin_service/$prov.origin_msg parent=$prov.parent_node/$prov.parent_msg hops=$prov.hops",
+            Uuid::nil(),
+            "Gateway",
+            &incoming,
+            &state,
+        );
+        assert!(rendered.contains("origin=Gateway/00000000-0000-0000-0000-000000000011"));
+        assert!(rendered.contains(
+            "parent=00000000-0000-0000-0000-000000000010/00000000-0000-0000-0000-000000000012"
+        ));
+        assert!(rendered.contains("hops=2"));
     }
 }

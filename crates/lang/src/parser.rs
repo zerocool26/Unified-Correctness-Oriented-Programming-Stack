@@ -1,4 +1,6 @@
-use crate::ast::{ActionDecl, HandlerDecl, Module, RemoteTarget, ServiceDecl, StateDecl};
+use crate::ast::{
+    ActionDecl, HandlerDecl, HandlerEffect, Module, RemoteTarget, ServiceDecl, StateDecl,
+};
 use std::fmt::{Display, Formatter};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,12 +80,30 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
             }
             current_handler = Some(HandlerDecl {
                 on: toks[1].clone(),
+                effects: None,
                 actions: Vec::new(),
             });
             continue;
         }
 
         ensure_handler(&current_service, &current_handler, line_no)?;
+        if line.starts_with("effects ") {
+            let handler = current_handler.as_mut().expect("handler existence checked");
+            if handler.effects.is_some() {
+                return Err(ParseError {
+                    line: line_no,
+                    message: "duplicate effects declaration in handler".into(),
+                });
+            }
+            if !handler.actions.is_empty() {
+                return Err(ParseError {
+                    line: line_no,
+                    message: "effects declaration must appear before actions in a handler".into(),
+                });
+            }
+            handler.effects = Some(parse_effects_decl(line, line_no)?);
+            continue;
+        }
         let action = parse_action(line, line_no, 0)?;
         current_handler
             .as_mut()
@@ -180,6 +200,55 @@ fn parse_state_decl(line: &str, line_no: usize) -> Result<StateDecl, ParseError>
     })
 }
 
+fn parse_effects_decl(line: &str, line_no: usize) -> Result<Vec<HandlerEffect>, ParseError> {
+    let toks = tokenize(line, line_no)?;
+    if toks.len() < 2 {
+        return Err(ParseError {
+            line: line_no,
+            message: "effects declaration must be: effects <effect...>".into(),
+        });
+    }
+
+    let mut out = Vec::new();
+    for raw in &toks[1..] {
+        for part in raw.split(',') {
+            let name = part.trim();
+            if name.is_empty() {
+                continue;
+            }
+            let effect = match name {
+                "log" => HandlerEffect::Log,
+                "state_read" => HandlerEffect::StateRead,
+                "state_write" => HandlerEffect::StateWrite,
+                "send_local" => HandlerEffect::SendLocal,
+                "send_remote" => HandlerEffect::SendRemote,
+                "timer_local" => HandlerEffect::TimerLocal,
+                "timer_remote" => HandlerEffect::TimerRemote,
+                _ => {
+                    return Err(ParseError {
+                        line: line_no,
+                        message: format!(
+                            "unknown effect `{name}`; expected log, state_read, state_write, send_local, send_remote, timer_local, timer_remote"
+                        ),
+                    });
+                }
+            };
+            if !out.contains(&effect) {
+                out.push(effect);
+            }
+        }
+    }
+
+    if out.is_empty() {
+        return Err(ParseError {
+            line: line_no,
+            message: "effects declaration must include at least one effect".into(),
+        });
+    }
+
+    Ok(out)
+}
+
 fn parse_action(line: &str, line_no: usize, depth: usize) -> Result<ActionDecl, ParseError> {
     if depth > 8 {
         return Err(ParseError {
@@ -207,6 +276,7 @@ fn parse_action_tokens(
         "log" => parse_log(toks, line_no),
         "set" => parse_set_state(toks, line_no),
         "inc" => parse_inc_state(toks, line_no),
+        "timer" => parse_timer_local(toks, line_no),
         "send" => parse_send(toks, line_no),
         "if" => parse_if_state_eq(toks, line_no, depth),
         other => Err(ParseError {
@@ -293,6 +363,67 @@ fn parse_if_state_eq(
         value,
         then_action: Box::new(nested),
     })
+}
+
+fn parse_timer_local(toks: &[String], line_no: usize) -> Result<ActionDecl, ParseError> {
+    if toks.len() < 5 {
+        return Err(ParseError {
+            line: line_no,
+            message: "timer action must be: timer <steps> [local|remote ...] <Service> <Message> <template>".into(),
+        });
+    }
+
+    let steps = toks[1].parse::<u64>().map_err(|_| ParseError {
+        line: line_no,
+        message: format!("invalid timer step value `{}`", toks[1]),
+    })?;
+    if steps == 0 {
+        return Err(ParseError {
+            line: line_no,
+            message: "timer steps must be >= 1".into(),
+        });
+    }
+
+    match toks[2].as_str() {
+        "remote" => {
+            if toks.len() < 7 {
+                return Err(ParseError {
+                    line: line_no,
+                    message: "remote timer must be: timer <steps> remote <peers|sender|node:...> <Service> <Message> <template>".into(),
+                });
+            }
+            let target = parse_remote_target(&toks[3], line_no)?;
+            Ok(ActionDecl::TimerRemote {
+                steps,
+                target,
+                service: toks[4].clone(),
+                message: toks[5].clone(),
+                template: toks[6..].join(" "),
+            })
+        }
+        "local" => {
+            if toks.len() < 6 {
+                return Err(ParseError {
+                    line: line_no,
+                    message:
+                        "local timer must be: timer <steps> local <Service> <Message> <template>"
+                            .into(),
+                });
+            }
+            Ok(ActionDecl::TimerLocal {
+                steps,
+                service: toks[3].clone(),
+                message: toks[4].clone(),
+                template: toks[5..].join(" "),
+            })
+        }
+        _ => Ok(ActionDecl::TimerLocal {
+            steps,
+            service: toks[2].clone(),
+            message: toks[3].clone(),
+            template: toks[4..].join(" "),
+        }),
+    }
 }
 
 fn parse_send(toks: &[String], line_no: usize) -> Result<ActionDecl, ParseError> {
@@ -405,7 +536,7 @@ fn tokenize(line: &str, line_no: usize) -> Result<Vec<String>, ParseError> {
 #[cfg(test)]
 mod tests {
     use super::parse_module;
-    use crate::ast::{ActionDecl, RemoteTarget};
+    use crate::ast::{ActionDecl, HandlerEffect, RemoteTarget};
 
     #[test]
     fn parses_service_handlers_and_actions() {
@@ -413,9 +544,12 @@ mod tests {
         service Gateway
         state sent = 0
         on start
+          effects state_write state_read log send_remote timer_local timer_remote
           inc sent
           if sent == 1 log "first send"
           send remote peers Echo hello "hello from $self_node"
+          timer 2 Gateway tick "tick-$state.sent"
+          timer 3 remote peers Echo hello "later-$state.sent"
         on echo_reply
           log "got $text"
 
@@ -430,6 +564,17 @@ mod tests {
         assert_eq!(gateway.name, "Gateway");
         assert_eq!(gateway.states.len(), 1);
         assert_eq!(gateway.handlers.len(), 2);
+        assert_eq!(
+            gateway.handlers[0].effects,
+            Some(vec![
+                HandlerEffect::StateWrite,
+                HandlerEffect::StateRead,
+                HandlerEffect::Log,
+                HandlerEffect::SendRemote,
+                HandlerEffect::TimerLocal,
+                HandlerEffect::TimerRemote
+            ])
+        );
 
         match &gateway.handlers[0].actions[2] {
             ActionDecl::SendRemote {
@@ -438,6 +583,36 @@ mod tests {
                 message,
                 ..
             } => {
+                assert_eq!(*target, RemoteTarget::Peers);
+                assert_eq!(service, "Echo");
+                assert_eq!(message, "hello");
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+
+        match &gateway.handlers[0].actions[3] {
+            ActionDecl::TimerLocal {
+                steps,
+                service,
+                message,
+                ..
+            } => {
+                assert_eq!(*steps, 2);
+                assert_eq!(service, "Gateway");
+                assert_eq!(message, "tick");
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+
+        match &gateway.handlers[0].actions[4] {
+            ActionDecl::TimerRemote {
+                steps,
+                target,
+                service,
+                message,
+                ..
+            } => {
+                assert_eq!(*steps, 3);
                 assert_eq!(*target, RemoteTarget::Peers);
                 assert_eq!(service, "Echo");
                 assert_eq!(message, "hello");

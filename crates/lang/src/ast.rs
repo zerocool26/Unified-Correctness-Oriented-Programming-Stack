@@ -19,7 +19,19 @@ pub struct StateDecl {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HandlerDecl {
     pub on: String,
+    pub effects: Option<Vec<HandlerEffect>>,
     pub actions: Vec<ActionDecl>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum HandlerEffect {
+    Log,
+    StateRead,
+    StateWrite,
+    SendLocal,
+    SendRemote,
+    TimerLocal,
+    TimerRemote,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +46,19 @@ pub enum ActionDecl {
     IncState {
         key: String,
         by: i64,
+    },
+    TimerLocal {
+        steps: u64,
+        service: String,
+        message: String,
+        template: String,
+    },
+    TimerRemote {
+        steps: u64,
+        target: RemoteTarget,
+        service: String,
+        message: String,
+        template: String,
     },
     SendLocal {
         service: String,
