@@ -1,0 +1,17 @@
+# Unified Correctness-Oriented service program.
+
+service Gateway
+state sent = 0
+on start
+  inc sent
+  if sent == 1 log "first broadcast from $self_node"
+  send remote peers Echo hello "hello #$state.sent from $self_node ($text)"
+on echo_reply
+  log "got echo reply from $from_node: $text (sent=$state.sent)"
+
+service Echo
+state seen = 0
+on hello
+  inc seen
+  log "echo received #$state.seen from $from_node: $text"
+  send remote sender Gateway echo_reply "echo#$state.seen($text)"

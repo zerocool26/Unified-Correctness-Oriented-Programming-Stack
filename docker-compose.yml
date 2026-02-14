@@ -1,0 +1,64 @@
+services:
+  node1:
+    build: .
+    command:
+      - "--node-id"
+      - "00000000-0000-0000-0000-000000000101"
+      - "--listen"
+      - "0.0.0.0:7001"
+      - "--peer"
+      - "00000000-0000-0000-0000-000000000102=node2:7002"
+      - "--peer"
+      - "00000000-0000-0000-0000-000000000103=node3:7003"
+      - "--trace"
+      - "/data/node1.trace.jsonl"
+      - "--bootstrap-hello"
+      - "--steps"
+      - "60"
+    depends_on:
+      - node2
+      - node3
+    volumes:
+      - ./demo-traces:/data
+    ports:
+      - "7001:7001"
+
+  node2:
+    build: .
+    command:
+      - "--node-id"
+      - "00000000-0000-0000-0000-000000000102"
+      - "--listen"
+      - "0.0.0.0:7002"
+      - "--peer"
+      - "00000000-0000-0000-0000-000000000101=node1:7001"
+      - "--peer"
+      - "00000000-0000-0000-0000-000000000103=node3:7003"
+      - "--trace"
+      - "/data/node2.trace.jsonl"
+      - "--steps"
+      - "60"
+    volumes:
+      - ./demo-traces:/data
+    ports:
+      - "7002:7002"
+
+  node3:
+    build: .
+    command:
+      - "--node-id"
+      - "00000000-0000-0000-0000-000000000103"
+      - "--listen"
+      - "0.0.0.0:7003"
+      - "--peer"
+      - "00000000-0000-0000-0000-000000000101=node1:7001"
+      - "--peer"
+      - "00000000-0000-0000-0000-000000000102=node2:7002"
+      - "--trace"
+      - "/data/node3.trace.jsonl"
+      - "--steps"
+      - "60"
+    volumes:
+      - ./demo-traces:/data
+    ports:
+      - "7003:7003"
