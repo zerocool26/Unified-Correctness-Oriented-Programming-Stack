@@ -1,5 +1,6 @@
 param(
     [switch]$SkipFaultMatrix,
+    [switch]$SkipClusterScenario,
     [switch]$SkipLean
 )
 
@@ -27,10 +28,18 @@ else {
     Write-Host "[4/4] fault matrix skipped"
 }
 
+if (-not $SkipClusterScenario) {
+    Write-Host "[5/5] cluster scenario"
+    pwsh -File scripts/cluster_scenario.ps1 | Out-Host
+}
+else {
+    Write-Host "[5/5] cluster scenario skipped"
+}
+
 if (-not $SkipLean) {
     $lakeCmd = Get-Command lake -ErrorAction SilentlyContinue
     if ($null -ne $lakeCmd) {
-        Write-Host "[5/5] lean kernel build"
+        Write-Host "[6/6] lean kernel build"
         Push-Location semantics-lean
         try {
             lake build | Out-Host
@@ -40,11 +49,11 @@ if (-not $SkipLean) {
         }
     }
     else {
-        Write-Host "[5/5] lean kernel build skipped (lake not installed)"
+        Write-Host "[6/6] lean kernel build skipped (lake not installed)"
     }
 }
 else {
-    Write-Host "[5/5] lean kernel build skipped"
+    Write-Host "[6/6] lean kernel build skipped"
 }
 
 Write-Host "Local CI checks passed."

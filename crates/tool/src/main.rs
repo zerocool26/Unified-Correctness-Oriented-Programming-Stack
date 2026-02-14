@@ -19,6 +19,9 @@ enum Command {
         node: runtime::event::NodeId,
         msg_id: MsgId,
     },
+    ClusterVerify {
+        paths: Vec<String>,
+    },
 }
 
 fn parse_command() -> Result<Command> {
@@ -27,6 +30,14 @@ fn parse_command() -> Result<Command> {
         [path] => Ok(Command::Summary { path: path.clone() }),
         [cmd, path] if cmd == "summary" => Ok(Command::Summary { path: path.clone() }),
         [cmd, path] if cmd == "verify" => Ok(Command::Verify { path: path.clone() }),
+        [cmd, paths @ ..] if cmd == "cluster-verify" => {
+            if paths.len() < 2 {
+                bail!("cluster-verify requires at least 2 trace paths");
+            }
+            Ok(Command::ClusterVerify {
+                paths: paths.to_vec(),
+            })
+        }
         [cmd, path] if cmd == "lineage" => Ok(Command::LineageSummary { path: path.clone() }),
         [cmd, path, node, msg_id] if cmd == "lineage-path" => {
             let node = Uuid::parse_str(node)
@@ -40,7 +51,7 @@ fn parse_command() -> Result<Command> {
             })
         }
         _ => bail!(
-            "usage:\n  cargo run -p tool -- <trace.jsonl>\n  cargo run -p tool -- summary <trace.jsonl>\n  cargo run -p tool -- verify <trace.jsonl>\n  cargo run -p tool -- lineage <trace.jsonl>\n  cargo run -p tool -- lineage-path <trace.jsonl> <from_node_uuid> <msg_id_uuid>"
+            "usage:\n  cargo run -p tool -- <trace.jsonl>\n  cargo run -p tool -- summary <trace.jsonl>\n  cargo run -p tool -- verify <trace.jsonl>\n  cargo run -p tool -- cluster-verify <trace1.jsonl> <trace2.jsonl> [traceN.jsonl...]\n  cargo run -p tool -- lineage <trace.jsonl>\n  cargo run -p tool -- lineage-path <trace.jsonl> <from_node_uuid> <msg_id_uuid>"
         ),
     }
 }
@@ -84,6 +95,21 @@ fn print_summary(path: &str, events: &[TraceEvent]) {
 struct VerifyReport {
     problems: Vec<String>,
     pending_messages: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ClusterTrace {
+    path: String,
+    events: Vec<TraceEvent>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ClusterVerifyReport {
+    problems: Vec<String>,
+    matched_recv: usize,
+    matched_drop: usize,
+    external_inbound: usize,
+    external_outbound: usize,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -799,6 +825,211 @@ fn verify_trace(events: &[TraceEvent]) -> VerifyReport {
     }
 }
 
+type ClusterKey = (runtime::event::NodeId, MsgId, runtime::event::NodeId);
+
+#[derive(Debug, Clone)]
+struct NetRecord {
+    path: String,
+    seq: u64,
+    payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+struct DropRecord {
+    path: String,
+    seq: u64,
+}
+
+fn event_local_node(kind: &EventKind) -> Option<runtime::event::NodeId> {
+    match kind {
+        EventKind::Spawn { node, .. }
+        | EventKind::Deliver { node, .. }
+        | EventKind::TimerFired { node, .. }
+        | EventKind::NetRecv { node, .. }
+        | EventKind::NetSend { node, .. }
+        | EventKind::Log { node, .. }
+        | EventKind::EffectObserved { node, .. }
+        | EventKind::FaultInjected { node, .. } => Some(*node),
+        EventKind::Send { .. } => None,
+    }
+}
+
+fn verify_cluster(traces: &[ClusterTrace]) -> ClusterVerifyReport {
+    let mut report = ClusterVerifyReport::default();
+    let mut included_nodes = HashSet::<runtime::event::NodeId>::new();
+
+    for trace in traces {
+        let mut nodes = HashSet::new();
+        for ev in &trace.events {
+            if let Some(node) = event_local_node(&ev.kind) {
+                nodes.insert(node);
+            }
+        }
+
+        if nodes.is_empty() {
+            report
+                .problems
+                .push(format!("trace `{}` has no node-scoped events", trace.path));
+            continue;
+        }
+        if nodes.len() > 1 {
+            report.problems.push(format!(
+                "trace `{}` mixes multiple node ids: {:?}",
+                trace.path, nodes
+            ));
+        }
+        included_nodes.extend(nodes);
+    }
+
+    let mut sends: HashMap<ClusterKey, NetRecord> = HashMap::new();
+    let mut recvs: HashMap<ClusterKey, NetRecord> = HashMap::new();
+    let mut drops: HashMap<ClusterKey, DropRecord> = HashMap::new();
+
+    for trace in traces {
+        for ev in &trace.events {
+            match &ev.kind {
+                EventKind::NetSend {
+                    node,
+                    to_node,
+                    msg_id,
+                    payload,
+                    ..
+                } => {
+                    let key = (*node, *msg_id, *to_node);
+                    if let Some(prev) = sends.insert(
+                        key,
+                        NetRecord {
+                            path: trace.path.clone(),
+                            seq: ev.seq,
+                            payload: payload.clone(),
+                        },
+                    ) {
+                        report.problems.push(format!(
+                            "duplicate NetSend key {}/{}/{} at {}:{} and {}:{}",
+                            key.0, key.1, key.2, prev.path, prev.seq, trace.path, ev.seq
+                        ));
+                    }
+                }
+                EventKind::NetRecv {
+                    node,
+                    from_node,
+                    msg_id,
+                    payload,
+                    ..
+                } => {
+                    let key = (*from_node, *msg_id, *node);
+                    if let Some(prev) = recvs.insert(
+                        key,
+                        NetRecord {
+                            path: trace.path.clone(),
+                            seq: ev.seq,
+                            payload: payload.clone(),
+                        },
+                    ) {
+                        report.problems.push(format!(
+                            "duplicate NetRecv key {}/{}/{} at {}:{} and {}:{}",
+                            key.0, key.1, key.2, prev.path, prev.seq, trace.path, ev.seq
+                        ));
+                    }
+                }
+                EventKind::FaultInjected {
+                    node,
+                    from_node,
+                    msg_id,
+                    action,
+                    ..
+                } => {
+                    if !matches!(action, FaultAction::Drop) {
+                        continue;
+                    }
+                    let key = (*from_node, *msg_id, *node);
+                    if let Some(prev) = drops.insert(
+                        key,
+                        DropRecord {
+                            path: trace.path.clone(),
+                            seq: ev.seq,
+                        },
+                    ) {
+                        report.problems.push(format!(
+                            "duplicate Drop fault key {}/{}/{} at {}:{} and {}:{}",
+                            key.0, key.1, key.2, prev.path, prev.seq, trace.path, ev.seq
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    for (key, recv) in &recvs {
+        let from_included = included_nodes.contains(&key.0);
+        if !from_included {
+            report.external_inbound += 1;
+            continue;
+        }
+
+        let Some(send) = sends.get(key) else {
+            report.problems.push(format!(
+                "NetRecv {}/{}/{} at {}:{} has no matching NetSend in provided traces",
+                key.0, key.1, key.2, recv.path, recv.seq
+            ));
+            continue;
+        };
+
+        if send.payload != recv.payload {
+            report.problems.push(format!(
+                "payload mismatch for {}/{}/{}: NetSend at {}:{} differs from NetRecv at {}:{}",
+                key.0, key.1, key.2, send.path, send.seq, recv.path, recv.seq
+            ));
+        } else {
+            report.matched_recv += 1;
+        }
+    }
+
+    for (key, drop) in &drops {
+        let from_included = included_nodes.contains(&key.0);
+        if !from_included {
+            report.external_inbound += 1;
+            continue;
+        }
+
+        if sends.contains_key(key) {
+            report.matched_drop += 1;
+        } else {
+            report.problems.push(format!(
+                "Drop fault {}/{}/{} at {}:{} has no matching NetSend in provided traces",
+                key.0, key.1, key.2, drop.path, drop.seq
+            ));
+        }
+    }
+
+    for key in sends.keys() {
+        let to_included = included_nodes.contains(&key.2);
+        if !to_included {
+            report.external_outbound += 1;
+            continue;
+        }
+
+        let has_recv = recvs.contains_key(key);
+        let has_drop = drops.contains_key(key);
+        if has_recv && has_drop {
+            report.problems.push(format!(
+                "message {}/{}/{} has both NetRecv and Drop fault evidence",
+                key.0, key.1, key.2
+            ));
+            continue;
+        }
+        if !has_recv && !has_drop {
+            report.problems.push(format!(
+                "NetSend {}/{}/{} has no matching NetRecv or Drop fault in provided traces",
+                key.0, key.1, key.2
+            ));
+        }
+    }
+
+    report
+}
+
 fn main() -> Result<()> {
     match parse_command()? {
         Command::Summary { path } => {
@@ -818,6 +1049,48 @@ fn main() -> Result<()> {
                 bail!("verify failed: {} issue(s)", report.problems.len());
             }
         }
+        Command::ClusterVerify { paths } => {
+            let mut traces = Vec::new();
+            let mut had_local_errors = false;
+
+            for path in paths {
+                let events = read_events(&path)?;
+                print_summary(&path, &events);
+                let report = verify_trace(&events);
+                if report.problems.is_empty() {
+                    println!(
+                        "verify({path}): OK (pending_messages={})",
+                        report.pending_messages
+                    );
+                } else {
+                    had_local_errors = true;
+                    for p in &report.problems {
+                        eprintln!("verify({path}): ERROR: {p}");
+                    }
+                }
+                traces.push(ClusterTrace { path, events });
+            }
+
+            if had_local_errors {
+                bail!("cluster-verify aborted: one or more traces failed local verify");
+            }
+
+            let report = verify_cluster(&traces);
+            if report.problems.is_empty() {
+                println!(
+                    "cluster-verify: OK (matched_recv={} matched_drop={} external_inbound={} external_outbound={})",
+                    report.matched_recv,
+                    report.matched_drop,
+                    report.external_inbound,
+                    report.external_outbound
+                );
+            } else {
+                for p in &report.problems {
+                    eprintln!("cluster-verify: ERROR: {p}");
+                }
+                bail!("cluster-verify failed: {} issue(s)", report.problems.len());
+            }
+        }
         Command::LineageSummary { path } => {
             let events = read_events(&path)?;
             print_summary(&path, &events);
@@ -834,7 +1107,9 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_lineage_index, summarize_lineage, verify_trace};
+    use super::{
+        build_lineage_index, summarize_lineage, verify_cluster, verify_trace, ClusterTrace,
+    };
     use runtime::event::{EffectKind, EventKind, FaultAction, TraceEvent};
     use serde_json::json;
 
@@ -844,6 +1119,72 @@ mod tests {
 
     fn event(seq: u64, kind: EventKind) -> TraceEvent {
         TraceEvent { seq, seed: 7, kind }
+    }
+
+    fn cluster_trace(path: &str, events: Vec<TraceEvent>) -> ClusterTrace {
+        ClusterTrace {
+            path: path.to_string(),
+            events,
+        }
+    }
+
+    fn net_send(
+        seq: u64,
+        node: runtime::event::NodeId,
+        to_node: runtime::event::NodeId,
+        from: runtime::event::ActorId,
+        msg_id: runtime::event::MsgId,
+        payload: serde_json::Value,
+    ) -> TraceEvent {
+        event(
+            seq,
+            EventKind::NetSend {
+                node,
+                to_node,
+                from,
+                msg_id,
+                payload,
+            },
+        )
+    }
+
+    fn net_recv(
+        seq: u64,
+        node: runtime::event::NodeId,
+        from_node: runtime::event::NodeId,
+        to: runtime::event::ActorId,
+        msg_id: runtime::event::MsgId,
+        payload: serde_json::Value,
+    ) -> TraceEvent {
+        event(
+            seq,
+            EventKind::NetRecv {
+                node,
+                from_node,
+                to,
+                msg_id,
+                payload,
+            },
+        )
+    }
+
+    fn drop_fault(
+        seq: u64,
+        node: runtime::event::NodeId,
+        from_node: runtime::event::NodeId,
+        to: runtime::event::ActorId,
+        msg_id: runtime::event::MsgId,
+    ) -> TraceEvent {
+        event(
+            seq,
+            EventKind::FaultInjected {
+                node,
+                from_node,
+                to,
+                msg_id,
+                action: FaultAction::Drop,
+            },
+        )
     }
 
     fn effect_observed(
@@ -1442,5 +1783,129 @@ mod tests {
         let summary = summarize_lineage(&index);
         assert_eq!(summary.total, 1);
         assert_eq!(summary.unresolved_external_parents, 1);
+    }
+
+    #[test]
+    fn cluster_verify_accepts_matching_send_and_recv() {
+        let n1 = parse_id("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+        let n2 = parse_id("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+        let from = parse_id("11111111-1111-1111-1111-111111111111");
+        let to = parse_id("22222222-2222-2222-2222-222222222222");
+        let msg = parse_id("00000000-0000-0000-0000-000000000001");
+        let payload = json!({"type":"x","from_node":n1.to_string(),"from_service":"A","text":"hello","provenance":{"origin_node":n1.to_string(),"origin_service":"A","origin_msg_id":msg.to_string(),"parent_node":n1.to_string(),"parent_msg_id":msg.to_string(),"hops":0}});
+
+        let traces = vec![
+            cluster_trace(
+                "n1.trace",
+                vec![net_send(0, n1, n2, from, msg, payload.clone())],
+            ),
+            cluster_trace(
+                "n2.trace",
+                vec![net_recv(0, n2, n1, to, msg, payload.clone())],
+            ),
+        ];
+
+        let report = verify_cluster(&traces);
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        assert_eq!(report.matched_recv, 1);
+        assert_eq!(report.matched_drop, 0);
+    }
+
+    #[test]
+    fn cluster_verify_accepts_drop_evidence() {
+        let n1 = parse_id("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+        let n2 = parse_id("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+        let from = parse_id("11111111-1111-1111-1111-111111111111");
+        let to = parse_id("22222222-2222-2222-2222-222222222222");
+        let msg = parse_id("00000000-0000-0000-0000-000000000001");
+        let payload = json!({"type":"x","from_node":n1.to_string(),"from_service":"A","text":"hello","provenance":{"origin_node":n1.to_string(),"origin_service":"A","origin_msg_id":msg.to_string(),"parent_node":n1.to_string(),"parent_msg_id":msg.to_string(),"hops":0}});
+
+        let traces = vec![
+            cluster_trace("n1.trace", vec![net_send(0, n1, n2, from, msg, payload)]),
+            cluster_trace("n2.trace", vec![drop_fault(0, n2, n1, to, msg)]),
+        ];
+
+        let report = verify_cluster(&traces);
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        assert_eq!(report.matched_recv, 0);
+        assert_eq!(report.matched_drop, 1);
+    }
+
+    #[test]
+    fn cluster_verify_rejects_missing_inbound_evidence() {
+        let n1 = parse_id("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+        let n2 = parse_id("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+        let from = parse_id("11111111-1111-1111-1111-111111111111");
+        let msg = parse_id("00000000-0000-0000-0000-000000000001");
+        let payload = json!({"type":"x","from_node":n1.to_string(),"from_service":"A","text":"hello","provenance":{"origin_node":n1.to_string(),"origin_service":"A","origin_msg_id":msg.to_string(),"parent_node":n1.to_string(),"parent_msg_id":msg.to_string(),"hops":0}});
+
+        let traces = vec![
+            cluster_trace("n1.trace", vec![net_send(0, n1, n2, from, msg, payload)]),
+            cluster_trace(
+                "n2.trace",
+                vec![event(
+                    0,
+                    EventKind::Spawn {
+                        node: n2,
+                        actor: parse_id("33333333-3333-3333-3333-333333333333"),
+                        service: "B".to_string(),
+                    },
+                )],
+            ),
+        ];
+
+        let report = verify_cluster(&traces);
+        assert!(
+            report
+                .problems
+                .iter()
+                .any(|p| p.contains("no matching NetRecv or Drop fault")),
+            "{:?}",
+            report.problems
+        );
+    }
+
+    #[test]
+    fn cluster_verify_rejects_payload_mismatch() {
+        let n1 = parse_id("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+        let n2 = parse_id("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+        let from = parse_id("11111111-1111-1111-1111-111111111111");
+        let to = parse_id("22222222-2222-2222-2222-222222222222");
+        let msg = parse_id("00000000-0000-0000-0000-000000000001");
+
+        let traces = vec![
+            cluster_trace(
+                "n1.trace",
+                vec![net_send(
+                    0,
+                    n1,
+                    n2,
+                    from,
+                    msg,
+                    json!({"type":"x","text":"hello"}),
+                )],
+            ),
+            cluster_trace(
+                "n2.trace",
+                vec![net_recv(
+                    0,
+                    n2,
+                    n1,
+                    to,
+                    msg,
+                    json!({"type":"x","text":"tampered"}),
+                )],
+            ),
+        ];
+
+        let report = verify_cluster(&traces);
+        assert!(
+            report
+                .problems
+                .iter()
+                .any(|p| p.contains("payload mismatch")),
+            "{:?}",
+            report.problems
+        );
     }
 }

@@ -37,6 +37,7 @@ runtime [options]
   --bootstrap-burst <n>       Number of hello messages per peer (default: 1)
   --steps <n>                 Max runtime scheduling steps (default: 40)
   --idle-sleep-ms <n>         Sleep n ms on idle steps (record mode only)
+  --startup-wait-ms <n>       Wait n ms before scheduling loop (record mode only)
   --fault-drop-every <n>      Drop every n-th inbound wire message
   --fault-delay-steps <n>     Delay inbound wire messages by n runtime steps
   --fault-reorder-window <n>  Reverse inbound arrivals in chunks of n
@@ -98,6 +99,17 @@ cargo run -p tool -- verify trace.jsonl
 ```
 
 `verify` exits non-zero on invariant violations (sequence/seed consistency and message lifecycle checks).
+
+Verify a closed distributed run across multiple node traces:
+
+```bash
+cargo run -p tool -- cluster-verify demo-traces/node1.trace.jsonl demo-traces/node2.trace.jsonl demo-traces/node3.trace.jsonl
+```
+
+`cluster-verify` first runs local `verify` on each trace, then checks cross-node network evidence:
+- every in-cluster `NetSend` must have either matching `NetRecv` or receiver-side `FaultInjected(Drop)`
+- matching `NetSend`/`NetRecv` payloads must be identical
+- use this for closed runs where all participating node traces are provided and steps are high enough to drain in-cluster traffic
 
 Inspect provenance lineage summary:
 
@@ -184,6 +196,12 @@ pwsh -File scripts/ci_local.ps1
 
 If Lean is installed (`lake` on `PATH`), the local CI script also builds `semantics-lean`.
 
+Run a closed two-node cluster scenario (bidirectional listeners + cluster verify):
+
+```bash
+pwsh -File scripts/cluster_scenario.ps1
+```
+
 ## Notes
 
 - Determinism contract: external nondeterminism is mediated through runtime trace events (`Deliver`, `NetRecv`, `NetSend`).
@@ -196,6 +214,8 @@ If Lean is installed (`lake` on `PATH`), the local CI script also builds `semant
 - Replay mode is strict: it fails if trace deliveries remain after `--steps` or if EOF leaves undelivered inbox messages.
 - Replay also verifies emitted side effects (`EffectObserved`/`Send`/`NetSend`/`Log`) against the trace in-order.
 - `tool verify` enforces that observed effects are a subset of declared effects and that effect evidence appears after each delivery.
+- `tool cluster-verify` enforces cross-node `NetSend`/`NetRecv`/drop consistency for closed distributed runs.
+- `--startup-wait-ms` can be used in record mode to avoid startup race sends before peers are listening.
 - Runtime payloads carry provenance lineage (origin/parent/hops), and `tool verify` checks lineage consistency.
 - Runtime behavior is executed from the parsed service language, not hardcoded Rust handlers.
 

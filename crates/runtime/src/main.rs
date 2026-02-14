@@ -53,6 +53,7 @@ struct Config {
     bootstrap_burst: u64,
     steps: u64,
     idle_sleep_ms: u64,
+    startup_wait_ms: u64,
     fault: FaultConfig,
 }
 
@@ -120,6 +121,7 @@ fn print_usage() {
     eprintln!("  --bootstrap-burst <n>       Number of start messages (default: 1)");
     eprintln!("  --steps <n>                 Max runtime scheduling steps (default: 40)");
     eprintln!("  --idle-sleep-ms <n>         Sleep n ms on idle steps (record mode only)");
+    eprintln!("  --startup-wait-ms <n>       Wait n ms before scheduling loop (record mode only)");
     eprintln!("  --fault-drop-every <n>      Drop every n-th inbound wire message");
     eprintln!("  --fault-delay-steps <n>     Delay inbound wire messages by n runtime steps");
     eprintln!("  --fault-reorder-window <n>  Reverse inbound arrivals in chunks of n");
@@ -144,6 +146,7 @@ fn parse_config(args: &[String]) -> Result<Config> {
     let mut bootstrap_burst: u64 = 1;
     let mut steps: u64 = 40;
     let mut idle_sleep_ms: u64 = 0;
+    let mut startup_wait_ms: u64 = 0;
     let mut fault = FaultConfig::default();
 
     let mut i = 1;
@@ -215,6 +218,13 @@ fn parse_config(args: &[String]) -> Result<Config> {
                     .parse::<u64>()
                     .with_context(|| format!("invalid --idle-sleep-ms value `{value}`"))?;
             }
+            "--startup-wait-ms" => {
+                i += 1;
+                let value = args.get(i).context("missing value for --startup-wait-ms")?;
+                startup_wait_ms = value
+                    .parse::<u64>()
+                    .with_context(|| format!("invalid --startup-wait-ms value `{value}`"))?;
+            }
             "--fault-drop-every" => {
                 i += 1;
                 let value = args
@@ -263,6 +273,7 @@ fn parse_config(args: &[String]) -> Result<Config> {
         bootstrap_burst,
         steps,
         idle_sleep_ms,
+        startup_wait_ms,
         fault,
     })
 }
@@ -1497,6 +1508,10 @@ fn main() -> Result<()> {
             .as_mut()
             .context("internal error: replay mode without replay cursor")?;
         verify_replay_emits(replay, cfg.node_id, &startup_expected)?;
+    }
+
+    if matches!(cfg.mode, Mode::Record) && cfg.startup_wait_ms > 0 {
+        std::thread::sleep(Duration::from_millis(cfg.startup_wait_ms));
     }
 
     let mut replay_exhausted = false;
