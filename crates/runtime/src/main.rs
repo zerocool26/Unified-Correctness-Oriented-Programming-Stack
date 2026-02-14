@@ -88,7 +88,7 @@ struct Program {
 #[derive(Debug, Clone)]
 struct HandlerPlan {
     actions: Vec<ActionDecl>,
-    declared_effects: Option<Vec<HandlerEffect>>,
+    declared_effects: Vec<HandlerEffect>,
 }
 
 fn next_deterministic_msg_id(node_id: Uuid, counter: &mut u64) -> Uuid {
@@ -310,18 +310,16 @@ fn load_program(path: &str) -> Result<Program> {
             let key = (service.name.clone(), handler.on.clone());
             let plan = handlers.entry(key).or_insert_with(|| HandlerPlan {
                 actions: Vec::new(),
-                declared_effects: None,
+                declared_effects: Vec::new(),
             });
-            if let Some(declared) = handler.effects {
-                if plan.declared_effects.is_some() {
-                    anyhow::bail!(
-                        "service `{}` handler `on {}` declares effects more than once",
-                        service.name,
-                        handler.on
-                    );
-                }
-                plan.declared_effects = Some(declared);
+            if !plan.declared_effects.is_empty() {
+                anyhow::bail!(
+                    "service `{}` handler `on {}` declares effects more than once",
+                    service.name,
+                    handler.on
+                );
             }
+            plan.declared_effects = handler.effects;
             plan.actions.extend(handler.actions);
         }
     }
@@ -335,16 +333,14 @@ fn load_program(path: &str) -> Result<Program> {
             validate_action(action, service_name, msg_type, state, &service_names)?;
         }
 
-        if let Some(declared) = plan.declared_effects.as_ref() {
-            let inferred = infer_effects(&plan.actions);
-            let declared_set: BTreeSet<HandlerEffect> = declared.iter().copied().collect();
-            if inferred != declared_set {
-                anyhow::bail!(
-                    "service `{service_name}` handler `on {msg_type}` effect contract mismatch: declared [{}], inferred [{}]",
-                    format_effects(&declared_set),
-                    format_effects(&inferred)
-                );
-            }
+        let inferred = infer_effects(&plan.actions);
+        let declared_set: BTreeSet<HandlerEffect> = plan.declared_effects.iter().copied().collect();
+        if inferred != declared_set {
+            anyhow::bail!(
+                "service `{service_name}` handler `on {msg_type}` effect contract mismatch: declared [{}], inferred [{}]",
+                format_effects(&declared_set),
+                format_effects(&inferred)
+            );
         }
     }
 
@@ -730,11 +726,7 @@ fn execute_actions(
         return Ok(ExecutedEffects::default());
     };
 
-    let declared = plan
-        .declared_effects
-        .as_ref()
-        .map(|declared| declared.iter().copied().collect())
-        .unwrap_or_else(|| infer_effects(&plan.actions));
+    let declared = plan.declared_effects.iter().copied().collect();
     let mut observed = BTreeSet::new();
 
     for action in &plan.actions {
@@ -1791,11 +1783,12 @@ mod tests {
 
     fn test_program(actions: Vec<ActionDecl>) -> Program {
         let mut handlers = HashMap::new();
+        let declared: Vec<HandlerEffect> = infer_effects(&actions).into_iter().collect();
         handlers.insert(
             ("Gateway".to_string(), "start".to_string()),
             HandlerPlan {
                 actions,
-                declared_effects: None,
+                declared_effects: declared,
             },
         );
         Program {
@@ -2024,5 +2017,26 @@ mod tests {
             "parent=00000000-0000-0000-0000-000000000010/00000000-0000-0000-0000-000000000012"
         ));
         assert!(rendered.contains("hops=2"));
+    }
+
+    #[test]
+    fn load_program_rejects_missing_effects_declaration() {
+        let path = std::env::temp_dir().join(format!("uco-missing-effects-{}.uco", Uuid::new_v4()));
+        let src = r#"
+service Gateway
+  on start
+    log "hello"
+"#;
+        std::fs::write(&path, src).expect("write temp program");
+
+        let res = load_program(path.to_str().expect("temp path should be utf8"));
+        let _ = std::fs::remove_file(&path);
+
+        let err = res.expect_err("load_program should reject missing effects");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("missing required effects declaration"),
+            "unexpected error: {msg}"
+        );
     }
 }

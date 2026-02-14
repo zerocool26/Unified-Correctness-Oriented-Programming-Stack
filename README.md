@@ -51,7 +51,7 @@ Syntax:
 - `service <Name>`
 - `state <name> = <int>`
 - `on <MessageType>`
-- `effects <effect...>` where effects are: `log`, `state_read`, `state_write`, `send_local`, `send_remote`, `timer_local`, `timer_remote`
+- `effects <effect...>` (required for every handler) where effects are: `log`, `state_read`, `state_write`, `send_local`, `send_remote`, `timer_local`, `timer_remote`
 - `log "<template>"`
 - `set <state> <int>`
 - `inc <state> [by]`
@@ -210,6 +210,7 @@ pwsh -File scripts/cluster_scenario.ps1
 - Timer actions are traced via `TimerFired` and replay-checked for deterministic firing order.
 - Service `log` side effects are traced via `Log` events and replay-checked in-order.
 - Every `Deliver` is followed by `EffectObserved`, recording declared vs observed handler effects for that delivery.
+- Program load requires explicit `effects ...` declarations for every handler.
 - Replay mode consumes recorded events and re-injects `NetRecv` before following `Deliver`.
 - Replay mode is strict: it fails if trace deliveries remain after `--steps` or if EOF leaves undelivered inbox messages.
 - Replay also verifies emitted side effects (`EffectObserved`/`Send`/`NetSend`/`Log`) against the trace in-order.

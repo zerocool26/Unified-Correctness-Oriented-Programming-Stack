@@ -19,7 +19,7 @@ pub struct StateDecl {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HandlerDecl {
     pub on: String,
-    pub effects: Option<Vec<HandlerEffect>>,
+    pub effects: Vec<HandlerEffect>,
     pub actions: Vec<ActionDecl>,
 }
 

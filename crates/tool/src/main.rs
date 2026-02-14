@@ -209,7 +209,7 @@ fn format_effects(effects: &BTreeSet<EffectKind>) -> String {
 
 fn verify_payload_lineage(
     seq: u64,
-    local_node: Uuid,
+    _local_node: Uuid,
     msg_id: MsgId,
     payload: &serde_json::Value,
     delivered_lineage: &mut HashMap<LineageKey, DeliveredLineage>,
@@ -322,11 +322,6 @@ fn verify_payload_lineage(
                     seq, msg_id, prov.origin_service, parent_node, parent_msg_id, parent.origin_service
                 ));
             }
-        } else if parent_node == local_node {
-            problems.push(format!(
-                "Deliver at seq {} msg_id={} references unknown parent={}/{}",
-                seq, msg_id, parent_node, parent_msg_id
-            ));
         }
     }
 
@@ -1663,6 +1658,74 @@ mod tests {
             "{:?}",
             report.problems
         );
+    }
+
+    #[test]
+    fn verify_accepts_cross_node_parent_reference_not_present_locally() {
+        let node1 = parse_id("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+        let node2 = parse_id("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+        let actor = parse_id("22222222-2222-2222-2222-222222222222");
+        let parent_msg = parse_id("00000000-0000-0000-0000-000000000001");
+        let child_msg = parse_id("00000000-0000-0000-0000-000000000002");
+        let origin_msg = parse_id("00000000-0000-0000-0000-000000000010");
+
+        let inbound_payload = json!({
+            "type": "x",
+            "from_node": node2.to_string(),
+            "from_service": "RemoteSvc",
+            "text": "payload",
+            "provenance": {
+                "origin_node": node2.to_string(),
+                "origin_service": "RemoteSvc",
+                "origin_msg_id": origin_msg.to_string(),
+                "parent_node": node1.to_string(),
+                "parent_msg_id": parent_msg.to_string(),
+                "hops": 2
+            }
+        });
+
+        let events = vec![
+            event(
+                0,
+                EventKind::Spawn {
+                    node: node1,
+                    actor,
+                    service: "B".to_string(),
+                },
+            ),
+            event(
+                1,
+                EventKind::NetSend {
+                    node: node1,
+                    to_node: node2,
+                    from: actor,
+                    msg_id: parent_msg,
+                    payload: json!({"type":"x","text":"parent"}),
+                },
+            ),
+            event(
+                2,
+                EventKind::NetRecv {
+                    node: node1,
+                    from_node: node2,
+                    to: actor,
+                    msg_id: child_msg,
+                    payload: inbound_payload,
+                },
+            ),
+            event(
+                3,
+                EventKind::Deliver {
+                    node: node1,
+                    to: actor,
+                    msg_id: child_msg,
+                },
+            ),
+            effect_observed(4, node1, actor, child_msg, vec![], vec![]),
+        ];
+
+        let report = verify_trace(&events);
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
     }
 
     #[test]

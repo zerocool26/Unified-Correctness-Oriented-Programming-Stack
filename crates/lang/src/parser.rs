@@ -80,7 +80,7 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
             }
             current_handler = Some(HandlerDecl {
                 on: toks[1].clone(),
-                effects: None,
+                effects: Vec::new(),
                 actions: Vec::new(),
             });
             continue;
@@ -89,7 +89,7 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
         ensure_handler(&current_service, &current_handler, line_no)?;
         if line.starts_with("effects ") {
             let handler = current_handler.as_mut().expect("handler existence checked");
-            if handler.effects.is_some() {
+            if !handler.effects.is_empty() {
                 return Err(ParseError {
                     line: line_no,
                     message: "duplicate effects declaration in handler".into(),
@@ -101,7 +101,7 @@ pub fn parse_module(src: &str) -> Result<Module, ParseError> {
                     message: "effects declaration must appear before actions in a handler".into(),
                 });
             }
-            handler.effects = Some(parse_effects_decl(line, line_no)?);
+            handler.effects = parse_effects_decl(line, line_no)?;
             continue;
         }
         let action = parse_action(line, line_no, 0)?;
@@ -164,6 +164,12 @@ fn flush_handler(
             return Err(ParseError {
                 line,
                 message: format!("handler `on {}` has no actions", h.on),
+            });
+        }
+        if h.effects.is_empty() {
+            return Err(ParseError {
+                line,
+                message: format!("handler `on {}` missing required effects declaration", h.on),
             });
         }
         current_service
@@ -551,10 +557,12 @@ mod tests {
           timer 2 Gateway tick "tick-$state.sent"
           timer 3 remote peers Echo hello "later-$state.sent"
         on echo_reply
+          effects log
           log "got $text"
 
         service Echo
         on hello
+          effects send_remote
           send remote sender Gateway echo_reply "echo($text)"
         "#;
 
@@ -566,14 +574,14 @@ mod tests {
         assert_eq!(gateway.handlers.len(), 2);
         assert_eq!(
             gateway.handlers[0].effects,
-            Some(vec![
+            vec![
                 HandlerEffect::StateWrite,
                 HandlerEffect::StateRead,
                 HandlerEffect::Log,
                 HandlerEffect::SendRemote,
                 HandlerEffect::TimerLocal,
                 HandlerEffect::TimerRemote
-            ])
+            ]
         );
 
         match &gateway.handlers[0].actions[2] {
@@ -619,5 +627,20 @@ mod tests {
             }
             other => panic!("unexpected action: {other:?}"),
         }
+    }
+
+    #[test]
+    fn rejects_handler_missing_effects_declaration() {
+        let src = r#"
+        service Gateway
+        on start
+          log "x"
+        "#;
+
+        let err = parse_module(src).expect_err("parse should fail");
+        assert!(
+            err.message.contains("missing required effects declaration"),
+            "unexpected error: {err}"
+        );
     }
 }
