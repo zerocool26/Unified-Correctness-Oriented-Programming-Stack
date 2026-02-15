@@ -1,0 +1,94 @@
+{
+  "default_profile": "strict",
+  "profile_resolution": {
+    "default_profile": "development",
+    "rules": [
+      {
+        "name": "protected-main",
+        "profile": "strict",
+        "branch_exact": [
+          "main",
+          "master"
+        ]
+      },
+      {
+        "name": "diagnostic-branches",
+        "profile": "investigation",
+        "branch_regex": "^(investigation|diagnostic|spike)/.+$"
+      },
+      {
+        "name": "hardening-window-branches",
+        "profile": "hardening-window",
+        "branch_regex": "^(hardening|stabilization)/.+$"
+      },
+      {
+        "name": "default-development",
+        "profile": "development",
+        "branch_glob": [
+          "*"
+        ]
+      }
+    ]
+  },
+  "profiles": {
+    "strict": {
+      "description": "No invariant debt allowed; no positive delta allowed.",
+      "max_total_issues": 0,
+      "max_local_issues": 0,
+      "max_cluster_issues": 0,
+      "max_total_delta_increase": 0,
+      "max_local_delta_increase": 0,
+      "max_cluster_delta_increase": 0,
+      "max_single_code_delta_increase": 0,
+      "fail_on_missing_previous": false
+    },
+    "development": {
+      "description": "Allows bounded transient debt for active development branches.",
+      "max_total_issues": 10,
+      "max_local_issues": 6,
+      "max_cluster_issues": 6,
+      "max_total_delta_increase": 4,
+      "max_local_delta_increase": 3,
+      "max_cluster_delta_increase": 3,
+      "max_single_code_delta_increase": 2,
+      "fail_on_missing_previous": false
+    },
+    "investigation": {
+      "description": "Loose thresholds for temporary diagnostics; still records policy evidence.",
+      "max_total_issues": 50,
+      "max_local_issues": 30,
+      "max_cluster_issues": 30,
+      "max_total_delta_increase": 20,
+      "max_local_delta_increase": 15,
+      "max_cluster_delta_increase": 15,
+      "max_single_code_delta_increase": 10,
+      "fail_on_missing_previous": false
+    },
+    "hardening-window": {
+      "description": "Temporary debt window profile with explicit expiration metadata.",
+      "max_total_issues": 0,
+      "max_local_issues": 0,
+      "max_cluster_issues": 0,
+      "max_total_delta_increase": 0,
+      "max_local_delta_increase": 0,
+      "max_cluster_delta_increase": 0,
+      "max_single_code_delta_increase": 0,
+      "fail_on_missing_previous": false,
+      "debt_window": {
+        "allow_until_utc": "2026-06-30T23:59:59Z",
+        "owner": "correctness-foundation",
+        "tracking_issue": "foundation-debt-window-0001",
+        "reason": "Short-term relaxation while hardening phased choreography and trend analytics.",
+        "threshold_overrides": {
+          "max_total_issues": 8,
+          "max_local_issues": 5,
+          "max_cluster_issues": 5,
+          "max_total_delta_increase": 3,
+          "max_local_delta_increase": 2,
+          "max_cluster_delta_increase": 2,
+          "max_single_code_delta_increase": 1
+        }
+      }
+    }
+  }
+}

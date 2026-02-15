@@ -54,6 +54,37 @@ function Get-ActionName {
     return $prop.Name
 }
 
+function Format-IssueSummary {
+    param($Issue)
+
+    if ($null -eq $Issue) {
+        return "issue=<none>"
+    }
+
+    return ("code={0} seq={1} node={2} actor={3} msg_id={4} message={5}" -f `
+            $Issue.code, $Issue.seq, $Issue.node, $Issue.actor, $Issue.msg_id, $Issue.message)
+}
+
+function Invoke-VerifyWithDiagnostics {
+    param(
+        [string]$ToolExe,
+        [string]$TracePath,
+        [string]$Label
+    )
+
+    $reportPath = "demo-traces/$Label.verify.report.json"
+    Remove-Item $reportPath -ErrorAction SilentlyContinue
+
+    & $ToolExe verify $TracePath --report-json $reportPath | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        if (Test-Path $reportPath) {
+            $report = Get-Content $reportPath -Raw | ConvertFrom-Json -Depth 64
+            throw ("Trace verify failed for {0}: {1}" -f $TracePath, (Format-IssueSummary -Issue $report.first_issue))
+        }
+        throw "Trace verify failed for $TracePath"
+    }
+}
+
 function Invoke-FaultScenario {
     param(
         [Parameter(Mandatory = $true)]
@@ -167,14 +198,8 @@ function Invoke-FaultScenario {
 
     Write-Host "[$Name] trace summary:"
     & $toolExe $node2Trace | Out-Host
-    & $toolExe verify $node2Trace | Out-Host
-    if ($LASTEXITCODE -ne 0) {
-        throw "[$Name] trace verify failed for $node2Trace"
-    }
-    & $toolExe verify $node1Trace | Out-Host
-    if ($LASTEXITCODE -ne 0) {
-        throw "[$Name] trace verify failed for $node1Trace"
-    }
+    Invoke-VerifyWithDiagnostics -ToolExe $toolExe -TracePath $node2Trace -Label "$Name-node2"
+    Invoke-VerifyWithDiagnostics -ToolExe $toolExe -TracePath $node1Trace -Label "$Name-node1"
     Write-Host "[$Name] assertions passed. FaultInjected=$($fiEvents.Count) NetRecv=$($netRecvEvents.Count)"
 }
 

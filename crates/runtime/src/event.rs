@@ -82,6 +82,13 @@ pub enum EventKind {
         msg_id: MsgId,
         action: FaultAction,
     },
+    FaultPolicy {
+        node: NodeId,
+        step: u64,
+        drop_every: Option<u64>,
+        delay_steps: u64,
+        reorder_window: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -70,5 +70,207 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: fault-matrix-traces
-          path: demo-traces/*.trace.jsonl
+          path: |
+            demo-traces/*.trace.jsonl
+            demo-traces/*.report.json
+          if-no-files-found: ignore
+
+  cluster-scenarios:
+    name: Cluster Scenarios (Windows)
+    runs-on: windows-latest
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run closed 2-node cluster scenario
+        shell: pwsh
+        run: ./scripts/cluster_scenario.ps1
+
+      - name: Run closed 3-node cluster scenario
+        shell: pwsh
+        run: ./scripts/cluster3_scenario.ps1
+
+      - name: Run mixed fault closed 2-node cluster matrix
+        shell: pwsh
+        run: ./scripts/cluster_fault_matrix.ps1
+
+      - name: Run mixed fault closed 3-node cluster matrix
+        shell: pwsh
+        run: ./scripts/cluster3_fault_matrix.ps1
+
+      - name: Run multi-target mixed fault closed 3-node cluster matrix
+        shell: pwsh
+        run: ./scripts/cluster3_multi_fault_matrix.ps1
+
+      - name: Run partition/churn envelope closed 3-node matrix
+        shell: pwsh
+        run: ./scripts/cluster3_envelope_matrix.ps1
+
+      - name: Run phased choreography closed 3-node matrix
+        shell: pwsh
+        run: ./scripts/cluster3_choreography_matrix.ps1
+
+      - name: Restore invariant trend baseline cache
+        id: trend_cache_restore
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            .ci-cache/invariant-trends.prev.json
+            .ci-cache/invariant-history
+          key: invariant-trends-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            invariant-trends-${{ runner.os }}-${{ github.ref_name }}-
+
+      - name: Build invariant trend summary
+        if: always()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path .ci-cache -Force | Out-Null
+          if (Test-Path .ci-cache/invariant-trends.prev.json) {
+            ./scripts/invariant_trends.ps1 -PreviousSummaryPath .ci-cache/invariant-trends.prev.json
+          }
+          else {
+            ./scripts/invariant_trends.ps1
+          }
+          Copy-Item demo-traces/invariant-trends.summary.json .ci-cache/invariant-trends.prev.json -Force
+
+      - name: Enforce invariant trend policy gate
+        if: always()
+        shell: pwsh
+        run: |
+          ./scripts/invariant_trend_policy.ps1 `
+            -SummaryPath demo-traces/invariant-trends.summary.json `
+            -PolicyFilePath configs/invariant-trend-policies.json `
+            -BranchName "${{ github.ref_name }}" `
+            -RunSource github-actions `
+            -GitHubEventName "${{ github.event_name }}" `
+            -GateReportPath demo-traces/invariant-trends.gate.json `
+            -PolicyReportPath demo-traces/invariant-trends.policy.json
+
+      - name: Validate invariant debt windows
+        if: always()
+        shell: pwsh
+        run: |
+          $args = @(
+            "-PolicyFilePath", "configs/invariant-trend-policies.json",
+            "-ReportPath", "demo-traces/invariant-trends.debt-windows.json",
+            "-WarnDays", "14",
+            "-FailDays", "7"
+          )
+          $failOnExpiringSoon = $false
+          if (Test-Path demo-traces/invariant-trends.policy.json) {
+            try {
+              $policy = Get-Content demo-traces/invariant-trends.policy.json -Raw | ConvertFrom-Json -Depth 32
+              if ([string]::Equals([string]$policy.profile, "strict", [System.StringComparison]::OrdinalIgnoreCase)) {
+                $failOnExpiringSoon = $true
+              }
+            }
+            catch {
+              $failOnExpiringSoon = $false
+            }
+          }
+          elseif ("${{ github.ref_name }}" -eq "main" -or "${{ github.ref_name }}" -eq "master") {
+            $failOnExpiringSoon = $true
+          }
+          if ($failOnExpiringSoon) {
+            $args += "-FailOnExpiringSoon"
+          }
+          ./scripts/invariant_trend_debt_windows.ps1 @args
+
+      - name: Append invariant trend history snapshot
+        if: always()
+        shell: pwsh
+        run: |
+          ./scripts/invariant_trend_history.ps1 `
+            -SummaryPath demo-traces/invariant-trends.summary.json `
+            -HistoryDir .ci-cache/invariant-history `
+            -IndexPath .ci-cache/invariant-history/index.json `
+            -MaxEntries 120 `
+            -RunSource github-actions
+
+      - name: Build invariant trend history analytics
+        if: always()
+        shell: pwsh
+        run: |
+          ./scripts/invariant_trend_analytics.ps1 `
+            -HistoryIndexPath .ci-cache/invariant-history/index.json `
+            -AnalyticsPath .ci-cache/invariant-history/analytics.json `
+            -MarkdownPath .ci-cache/invariant-history/analytics.md
+
+      - name: Build invariant trend signals
+        if: always()
+        shell: pwsh
+        run: |
+          ./scripts/invariant_trend_signals.ps1 `
+            -SummaryPath demo-traces/invariant-trends.summary.json `
+            -GateReportPath demo-traces/invariant-trends.gate.json `
+            -PolicyReportPath demo-traces/invariant-trends.policy.json `
+            -DebtWindowReportPath demo-traces/invariant-trends.debt-windows.json `
+            -AnalyticsPath .ci-cache/invariant-history/analytics.json `
+            -SignalsPath demo-traces/invariant-trends.signals.json
+
+      - name: Publish invariant trend notifications
+        if: always()
+        shell: pwsh
+        env:
+          INVARIANT_TREND_WEBHOOK_URL: ${{ secrets.INVARIANT_TREND_WEBHOOK_URL }}
+          INVARIANT_TREND_NOTIFY_FAIL_ON_DELIVERY: ${{ vars.INVARIANT_TREND_NOTIFY_FAIL_ON_DELIVERY }}
+        run: |
+          $notifyArgs = @(
+            "-SignalsPath", "demo-traces/invariant-trends.signals.json",
+            "-SummaryPath", "demo-traces/invariant-trends.summary.json",
+            "-MarkdownPath", "demo-traces/invariant-trends.notify.md",
+            "-PayloadPath", "demo-traces/invariant-trends.notify.payload.json",
+            "-MinSeverity", "warn",
+            "-AppendGitHubStepSummary"
+          )
+          if (-not [string]::IsNullOrWhiteSpace($env:INVARIANT_TREND_WEBHOOK_URL)) {
+            $notifyArgs += @("-WebhookUrl", $env:INVARIANT_TREND_WEBHOOK_URL)
+          }
+          if ([string]::Equals([string]$env:INVARIANT_TREND_NOTIFY_FAIL_ON_DELIVERY, "true", [System.StringComparison]::OrdinalIgnoreCase)) {
+            $notifyArgs += "-FailOnDeliveryError"
+          }
+          ./scripts/invariant_trend_notify.ps1 @notifyArgs
+
+      - name: Enforce demo artifact storage budget
+        if: always()
+        shell: pwsh
+        run: ./scripts/artifact_storage_guard.ps1 -MaxTotalMB 64 -KeepLatest 120 -MinKeep 60
+
+      - name: Save invariant trend baseline cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .ci-cache/invariant-trends.prev.json
+            .ci-cache/invariant-history
+          key: invariant-trends-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+
+      - name: Upload cluster traces
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cluster-scenario-traces
+          path: |
+            demo-traces/*.trace.jsonl
+            demo-traces/*.report.json
+            demo-traces/*.scenario.json
+            demo-traces/*.index.json
+            demo-traces/invariant-trends.summary.json
+            demo-traces/invariant-trends.summary.md
+            demo-traces/invariant-trends.gate.json
+            demo-traces/invariant-trends.policy.json
+            demo-traces/invariant-trends.debt-windows.json
+            demo-traces/invariant-trends.signals.json
+            demo-traces/invariant-trends.notify.md
+            demo-traces/invariant-trends.notify.payload.json
+            demo-traces/artifact-storage.summary.json
+            .ci-cache/invariant-history/index.json
+            .ci-cache/invariant-history/analytics.json
+            .ci-cache/invariant-history/analytics.md
           if-no-files-found: ignore

@@ -2,6 +2,7 @@ use anyhow::{bail, Context, Result};
 use runtime::event::{ActorId, EffectKind, EventKind, FaultAction, MsgId, TraceEvent};
 use runtime::trace::TraceReader;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fs;
 use uuid::Uuid;
 
 enum Command {
@@ -10,6 +11,7 @@ enum Command {
     },
     Verify {
         path: String,
+        report_json: Option<String>,
     },
     LineageSummary {
         path: String,
@@ -21,27 +23,124 @@ enum Command {
     },
     ClusterVerify {
         paths: Vec<String>,
+        report_json: Option<String>,
     },
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+struct ProblemDetail {
+    code: &'static str,
+    seq: Option<u64>,
+    node: Option<String>,
+    actor: Option<String>,
+    msg_id: Option<String>,
+    message: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct VerifyDiagnosticsReport {
+    mode: &'static str,
+    path: String,
+    ok: bool,
+    pending_messages: usize,
+    issue_count: usize,
+    first_issue: Option<ProblemDetail>,
+    issues: Vec<ProblemDetail>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct LocalTraceDiagnostics {
+    path: String,
+    ok: bool,
+    pending_messages: usize,
+    issue_count: usize,
+    first_issue: Option<ProblemDetail>,
+    issues: Vec<ProblemDetail>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ClusterDiagnostics {
+    matched_recv: usize,
+    matched_drop: usize,
+    resolved_lineage_parents: usize,
+    external_lineage_parents: usize,
+    external_inbound: usize,
+    external_outbound: usize,
+    issue_count: usize,
+    first_issue: Option<ProblemDetail>,
+    issues: Vec<ProblemDetail>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ClusterVerifyDiagnosticsReport {
+    mode: &'static str,
+    ok: bool,
+    traces: Vec<String>,
+    local: Vec<LocalTraceDiagnostics>,
+    cluster: Option<ClusterDiagnostics>,
+}
+
+fn usage_message() -> &'static str {
+    "usage:\n  cargo run -p tool -- <trace.jsonl>\n  cargo run -p tool -- summary <trace.jsonl>\n  cargo run -p tool -- verify <trace.jsonl> [--report-json <path>]\n  cargo run -p tool -- cluster-verify <trace1.jsonl> <trace2.jsonl> [traceN.jsonl...] [--report-json <path>]\n  cargo run -p tool -- lineage <trace.jsonl>\n  cargo run -p tool -- lineage-path <trace.jsonl> <from_node_uuid> <msg_id_uuid>"
+}
+
+fn split_report_json_flag(args: &[String]) -> Result<(Vec<String>, Option<String>)> {
+    let mut out = Vec::new();
+    let mut report_json = None;
+    let mut i = 0usize;
+    while i < args.len() {
+        if args[i] == "--report-json" {
+            i += 1;
+            let value = args.get(i).context("missing value for --report-json")?;
+            if report_json.is_some() {
+                bail!("duplicate --report-json");
+            }
+            report_json = Some(value.clone());
+        } else {
+            out.push(args[i].clone());
+        }
+        i += 1;
+    }
+    Ok((out, report_json))
+}
+
 fn parse_command() -> Result<Command> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    let (args, report_json) = split_report_json_flag(&raw_args)?;
+
     match args.as_slice() {
-        [path] => Ok(Command::Summary { path: path.clone() }),
-        [cmd, path] if cmd == "summary" => Ok(Command::Summary { path: path.clone() }),
-        [cmd, path] if cmd == "verify" => Ok(Command::Verify { path: path.clone() }),
+        [path] if report_json.is_none() => Ok(Command::Summary { path: path.clone() }),
+        [cmd, path] if cmd == "summary" => {
+            if report_json.is_some() {
+                bail!("--report-json is only valid with verify or cluster-verify");
+            }
+            Ok(Command::Summary { path: path.clone() })
+        }
+        [cmd, path] if cmd == "verify" => Ok(Command::Verify {
+            path: path.clone(),
+            report_json,
+        }),
         [cmd, paths @ ..] if cmd == "cluster-verify" => {
             if paths.len() < 2 {
                 bail!("cluster-verify requires at least 2 trace paths");
             }
             Ok(Command::ClusterVerify {
                 paths: paths.to_vec(),
+                report_json,
             })
         }
-        [cmd, path] if cmd == "lineage" => Ok(Command::LineageSummary { path: path.clone() }),
+        [cmd, path] if cmd == "lineage" => {
+            if report_json.is_some() {
+                bail!("--report-json is only valid with verify or cluster-verify");
+            }
+            Ok(Command::LineageSummary { path: path.clone() })
+        }
         [cmd, path, node, msg_id] if cmd == "lineage-path" => {
-            let node = Uuid::parse_str(node)
-                .map_err(|_| anyhow::anyhow!("invalid node id `{node}`"))?;
+            if report_json.is_some() {
+                bail!("--report-json is only valid with verify or cluster-verify");
+            }
+            let node =
+                Uuid::parse_str(node).map_err(|_| anyhow::anyhow!("invalid node id `{node}`"))?;
             let msg_id = Uuid::parse_str(msg_id)
                 .map_err(|_| anyhow::anyhow!("invalid msg id `{msg_id}`"))?;
             Ok(Command::LineagePath {
@@ -50,10 +149,167 @@ fn parse_command() -> Result<Command> {
                 msg_id,
             })
         }
-        _ => bail!(
-            "usage:\n  cargo run -p tool -- <trace.jsonl>\n  cargo run -p tool -- summary <trace.jsonl>\n  cargo run -p tool -- verify <trace.jsonl>\n  cargo run -p tool -- cluster-verify <trace1.jsonl> <trace2.jsonl> [traceN.jsonl...]\n  cargo run -p tool -- lineage <trace.jsonl>\n  cargo run -p tool -- lineage-path <trace.jsonl> <from_node_uuid> <msg_id_uuid>"
-        ),
+        _ => bail!("{}", usage_message()),
     }
+}
+
+fn classify_problem(problem: &str) -> &'static str {
+    if problem.contains("seq mismatch") {
+        "trace_seq_mismatch"
+    } else if problem.contains("seed mismatch") {
+        "trace_seed_mismatch"
+    } else if problem.contains("without prior Send/NetRecv") {
+        "deliver_without_source"
+    } else if problem.contains("without EffectObserved") {
+        "deliver_without_effect_observed"
+    } else if problem.contains("without preceding Deliver") {
+        "effect_without_deliver"
+    } else if problem.contains("does not match preceding Deliver") {
+        "effect_deliver_mismatch"
+    } else if problem.contains("undeclared observed effects") {
+        "effect_undeclared_observed"
+    } else if problem.contains("duplicate declared effects") {
+        "effect_declared_duplicate"
+    } else if problem.contains("duplicate observed effects") {
+        "effect_observed_duplicate"
+    } else if problem.contains("payload decode failed") {
+        "payload_decode_failed"
+    } else if problem.contains("payload missing provenance") {
+        "payload_missing_provenance"
+    } else if problem.contains("invalid provenance field") {
+        "payload_invalid_provenance_field"
+    } else if problem.contains("has hops=0 but") {
+        "lineage_invalid_root"
+    } else if problem.contains("has hops>0 but parent_msg_id is self") {
+        "lineage_parent_self"
+    } else if problem.contains("does not match parent") || problem.contains("has hops=") {
+        "lineage_parent_mismatch"
+    } else if problem.contains("dropped earlier but later NetRecv observed") {
+        "fault_drop_recv_conflict"
+    } else if problem.contains("TimerFired") && problem.contains("not followed by Send/NetSend") {
+        "timer_without_immediate_emit"
+    } else if problem.contains("TimerFired") && problem.contains("expected next send from actor") {
+        "timer_emit_actor_mismatch"
+    } else if problem.contains("TimerFired")
+        && problem.contains("reached end-of-trace without Send/NetSend")
+    {
+        "timer_without_emit_end_of_trace"
+    } else if problem.contains("unknown actor") {
+        "unknown_actor_reference"
+    } else if problem.contains("no matching NetRecv or Drop fault") {
+        "cluster_send_missing_inbound_evidence"
+    } else if problem.contains("has no matching NetSend in provided traces") {
+        "cluster_missing_send"
+    } else if problem.contains("payload mismatch") {
+        "cluster_payload_mismatch"
+    } else if problem.contains("has both NetRecv and Drop fault evidence") {
+        "cluster_conflicting_recv_and_drop"
+    } else if problem.contains("missing in-cluster parent") {
+        "cluster_missing_lineage_parent"
+    } else if problem.contains("duplicate NetSend key")
+        || problem.contains("duplicate NetRecv key")
+        || problem.contains("duplicate Drop fault key")
+    {
+        "cluster_duplicate_network_key"
+    } else if problem.contains("duplicate delivered lineage key") {
+        "cluster_duplicate_lineage_key"
+    } else if problem.contains("invalid parent reference") {
+        "lineage_invalid_parent_reference"
+    } else if problem.contains("mixes multiple node ids") {
+        "cluster_trace_mixed_nodes"
+    } else if problem.contains("has no node-scoped events") {
+        "cluster_trace_missing_node_scope"
+    } else {
+        "unknown"
+    }
+}
+
+fn extract_first_u64_after(problem: &str, marker: &str) -> Option<u64> {
+    let idx = problem.find(marker)?;
+    let rest = &problem[idx + marker.len()..];
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse::<u64>().ok()
+}
+
+fn parse_uuid_token(raw: &str) -> Option<String> {
+    let token =
+        raw.trim_matches(|c: char| c != '-' && !c.is_ascii_hexdigit() && c != '/' && c != '`');
+    for candidate in token.split('/') {
+        if Uuid::parse_str(candidate).is_ok() {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+fn extract_uuid_after(problem: &str, marker: &str) -> Option<String> {
+    let idx = problem.find(marker)?;
+    let rest = &problem[idx + marker.len()..];
+    let token = rest
+        .split(|c: char| c.is_whitespace() || c == ',' || c == ')' || c == ']' || c == ';')
+        .next()?;
+    parse_uuid_token(token)
+}
+
+fn extract_all_uuids(problem: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for token in problem.split(|c: char| {
+        c.is_whitespace()
+            || c == ','
+            || c == ':'
+            || c == '('
+            || c == ')'
+            || c == '['
+            || c == ']'
+            || c == ';'
+    }) {
+        if let Some(uuid) = parse_uuid_token(token) {
+            if !out.contains(&uuid) {
+                out.push(uuid);
+            }
+        }
+    }
+    out
+}
+
+fn build_problem_detail(problem: &str) -> ProblemDetail {
+    let seq = extract_first_u64_after(problem, "seq ");
+    let mut msg_id = extract_uuid_after(problem, "msg_id=")
+        .or_else(|| extract_uuid_after(problem, "msg_id "))
+        .or_else(|| extract_uuid_after(problem, "msg_id"));
+    let mut node = extract_uuid_after(problem, "node=")
+        .or_else(|| extract_uuid_after(problem, "from_node="))
+        .or_else(|| extract_uuid_after(problem, "local_node="));
+    let actor = extract_uuid_after(problem, "actor=")
+        .or_else(|| extract_uuid_after(problem, "actor "))
+        .or_else(|| extract_uuid_after(problem, "to="))
+        .or_else(|| extract_uuid_after(problem, "from actor "));
+
+    let uuids = extract_all_uuids(problem);
+    if node.is_none() {
+        node = uuids.first().cloned();
+    }
+    if msg_id.is_none() {
+        msg_id = uuids.get(1).cloned();
+    }
+
+    ProblemDetail {
+        code: classify_problem(problem),
+        seq,
+        node,
+        actor,
+        msg_id,
+        message: problem.to_string(),
+    }
+}
+
+fn write_json_report<T: serde::Serialize>(path: &str, report: &T) -> Result<()> {
+    let json = serde_json::to_string_pretty(report).context("serialize report json")?;
+    fs::write(path, json).with_context(|| format!("write report json `{path}`"))?;
+    Ok(())
 }
 
 fn event_kind_name(kind: &EventKind) -> &'static str {
@@ -67,6 +323,7 @@ fn event_kind_name(kind: &EventKind) -> &'static str {
         EventKind::Log { .. } => "Log",
         EventKind::EffectObserved { .. } => "EffectObserved",
         EventKind::FaultInjected { .. } => "FaultInjected",
+        EventKind::FaultPolicy { .. } => "FaultPolicy",
     }
 }
 
@@ -108,8 +365,54 @@ struct ClusterVerifyReport {
     problems: Vec<String>,
     matched_recv: usize,
     matched_drop: usize,
+    resolved_lineage_parents: usize,
+    external_lineage_parents: usize,
     external_inbound: usize,
     external_outbound: usize,
+}
+
+fn to_problem_details(problems: &[String]) -> Vec<ProblemDetail> {
+    problems.iter().map(|p| build_problem_detail(p)).collect()
+}
+
+fn build_verify_diagnostics(path: &str, report: &VerifyReport) -> VerifyDiagnosticsReport {
+    let issues = to_problem_details(&report.problems);
+    VerifyDiagnosticsReport {
+        mode: "verify",
+        path: path.to_string(),
+        ok: issues.is_empty(),
+        pending_messages: report.pending_messages,
+        issue_count: issues.len(),
+        first_issue: issues.first().cloned(),
+        issues,
+    }
+}
+
+fn build_local_trace_diagnostics(path: &str, report: &VerifyReport) -> LocalTraceDiagnostics {
+    let issues = to_problem_details(&report.problems);
+    LocalTraceDiagnostics {
+        path: path.to_string(),
+        ok: issues.is_empty(),
+        pending_messages: report.pending_messages,
+        issue_count: issues.len(),
+        first_issue: issues.first().cloned(),
+        issues,
+    }
+}
+
+fn build_cluster_diagnostics(report: &ClusterVerifyReport) -> ClusterDiagnostics {
+    let issues = to_problem_details(&report.problems);
+    ClusterDiagnostics {
+        matched_recv: report.matched_recv,
+        matched_drop: report.matched_drop,
+        resolved_lineage_parents: report.resolved_lineage_parents,
+        external_lineage_parents: report.external_lineage_parents,
+        external_inbound: report.external_inbound,
+        external_outbound: report.external_outbound,
+        issue_count: issues.len(),
+        first_issue: issues.first().cloned(),
+        issues,
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -288,7 +591,7 @@ fn verify_payload_lineage(
             ));
         }
     } else {
-        if parent_msg_id == msg_id {
+        if parent_node == from_node_id && parent_msg_id == msg_id {
             problems.push(format!(
                 "Deliver at seq {} msg_id={} has hops>0 but parent_msg_id is self",
                 seq, msg_id
@@ -795,6 +1098,7 @@ fn verify_trace(events: &[TraceEvent]) -> VerifyReport {
                     dropped.insert((*from_node, *to, *msg_id));
                 }
             }
+            EventKind::FaultPolicy { .. } => {}
             EventKind::TimerFired { from, timer_id, .. } => {
                 pending_timer_emit = Some((ev.seq, *from, *timer_id));
             }
@@ -844,7 +1148,8 @@ fn event_local_node(kind: &EventKind) -> Option<runtime::event::NodeId> {
         | EventKind::NetSend { node, .. }
         | EventKind::Log { node, .. }
         | EventKind::EffectObserved { node, .. }
-        | EventKind::FaultInjected { node, .. } => Some(*node),
+        | EventKind::FaultInjected { node, .. }
+        | EventKind::FaultPolicy { node, .. } => Some(*node),
         EventKind::Send { .. } => None,
     }
 }
@@ -1022,6 +1327,104 @@ fn verify_cluster(traces: &[ClusterTrace]) -> ClusterVerifyReport {
         }
     }
 
+    let mut global_lineage: HashMap<LineageKey, (LineageRecord, String)> = HashMap::new();
+    for trace in traces {
+        let index = build_lineage_index(&trace.events);
+        for (key, rec) in index {
+            if let Some((prev, prev_path)) =
+                global_lineage.insert(key, (rec.clone(), trace.path.clone()))
+            {
+                report.problems.push(format!(
+                    "duplicate delivered lineage key {}/{} at {}:{} and {}:{}",
+                    key.0, key.1, prev_path, prev.seq, trace.path, rec.seq
+                ));
+            }
+        }
+    }
+
+    for (key, (rec, path)) in &global_lineage {
+        if rec.provenance.hops == 0 {
+            continue;
+        }
+
+        let parent = match lineage_parent_key(rec) {
+            Ok(parent) => parent,
+            Err(err) => {
+                report.problems.push(format!(
+                    "lineage record {}/{} at {}:{} has invalid parent reference: {}",
+                    key.0, key.1, path, rec.seq, err
+                ));
+                continue;
+            }
+        };
+
+        if let Some((parent_rec, parent_path)) = global_lineage.get(&parent) {
+            report.resolved_lineage_parents += 1;
+            let expected_hops = parent_rec.provenance.hops.saturating_add(1);
+            if rec.provenance.hops != expected_hops {
+                report.problems.push(format!(
+                    "lineage record {}/{} at {}:{} has hops={} but parent {}/{} at {}:{} has hops={}",
+                    key.0,
+                    key.1,
+                    path,
+                    rec.seq,
+                    rec.provenance.hops,
+                    parent.0,
+                    parent.1,
+                    parent_path,
+                    parent_rec.seq,
+                    parent_rec.provenance.hops
+                ));
+            }
+            if rec.provenance.origin_msg_id != parent_rec.provenance.origin_msg_id {
+                report.problems.push(format!(
+                    "lineage record {}/{} at {}:{} origin_msg_id={} does not match parent {}/{} origin_msg_id={}",
+                    key.0,
+                    key.1,
+                    path,
+                    rec.seq,
+                    rec.provenance.origin_msg_id,
+                    parent.0,
+                    parent.1,
+                    parent_rec.provenance.origin_msg_id
+                ));
+            }
+            if rec.provenance.origin_node != parent_rec.provenance.origin_node {
+                report.problems.push(format!(
+                    "lineage record {}/{} at {}:{} origin_node={} does not match parent {}/{} origin_node={}",
+                    key.0,
+                    key.1,
+                    path,
+                    rec.seq,
+                    rec.provenance.origin_node,
+                    parent.0,
+                    parent.1,
+                    parent_rec.provenance.origin_node
+                ));
+            }
+            if rec.provenance.origin_service != parent_rec.provenance.origin_service {
+                report.problems.push(format!(
+                    "lineage record {}/{} at {}:{} origin_service={} does not match parent {}/{} origin_service={}",
+                    key.0,
+                    key.1,
+                    path,
+                    rec.seq,
+                    rec.provenance.origin_service,
+                    parent.0,
+                    parent.1,
+                    parent_rec.provenance.origin_service
+                ));
+            }
+        } else if included_nodes.contains(&parent.0) {
+            report.problems.push(format!(
+                "lineage record {}/{} at {}:{} references missing in-cluster parent {}/{}",
+                key.0, key.1, path, rec.seq, parent.0, parent.1
+            ));
+        } else {
+            report.external_lineage_parents += 1;
+        }
+    }
+
     report
 }
 
@@ -1031,10 +1434,15 @@ fn main() -> Result<()> {
             let events = read_events(&path)?;
             print_summary(&path, &events);
         }
-        Command::Verify { path } => {
+        Command::Verify { path, report_json } => {
             let events = read_events(&path)?;
             print_summary(&path, &events);
             let report = verify_trace(&events);
+            let diagnostics = build_verify_diagnostics(&path, &report);
+            if let Some(report_path) = report_json.as_deref() {
+                write_json_report(report_path, &diagnostics)?;
+                println!("verify: report-json: {report_path}");
+            }
             if report.problems.is_empty() {
                 println!("verify: OK (pending_messages={})", report.pending_messages);
             } else {
@@ -1044,14 +1452,16 @@ fn main() -> Result<()> {
                 bail!("verify failed: {} issue(s)", report.problems.len());
             }
         }
-        Command::ClusterVerify { paths } => {
+        Command::ClusterVerify { paths, report_json } => {
             let mut traces = Vec::new();
             let mut had_local_errors = false;
+            let mut local_diagnostics = Vec::new();
 
-            for path in paths {
+            for path in &paths {
                 let events = read_events(&path)?;
                 print_summary(&path, &events);
                 let report = verify_trace(&events);
+                local_diagnostics.push(build_local_trace_diagnostics(path, &report));
                 if report.problems.is_empty() {
                     println!(
                         "verify({path}): OK (pending_messages={})",
@@ -1063,19 +1473,47 @@ fn main() -> Result<()> {
                         eprintln!("verify({path}): ERROR: {p}");
                     }
                 }
-                traces.push(ClusterTrace { path, events });
+                traces.push(ClusterTrace {
+                    path: path.clone(),
+                    events,
+                });
             }
 
             if had_local_errors {
+                if let Some(report_path) = report_json.as_deref() {
+                    let diagnostics = ClusterVerifyDiagnosticsReport {
+                        mode: "cluster-verify",
+                        ok: false,
+                        traces: paths.clone(),
+                        local: local_diagnostics,
+                        cluster: None,
+                    };
+                    write_json_report(report_path, &diagnostics)?;
+                    println!("cluster-verify: report-json: {report_path}");
+                }
                 bail!("cluster-verify aborted: one or more traces failed local verify");
             }
 
             let report = verify_cluster(&traces);
+            let cluster_diagnostics = build_cluster_diagnostics(&report);
+            if let Some(report_path) = report_json.as_deref() {
+                let diagnostics = ClusterVerifyDiagnosticsReport {
+                    mode: "cluster-verify",
+                    ok: report.problems.is_empty(),
+                    traces: paths.clone(),
+                    local: local_diagnostics,
+                    cluster: Some(cluster_diagnostics),
+                };
+                write_json_report(report_path, &diagnostics)?;
+                println!("cluster-verify: report-json: {report_path}");
+            }
             if report.problems.is_empty() {
                 println!(
-                    "cluster-verify: OK (matched_recv={} matched_drop={} external_inbound={} external_outbound={})",
+                    "cluster-verify: OK (matched_recv={} matched_drop={} resolved_lineage_parents={} external_lineage_parents={} external_inbound={} external_outbound={})",
                     report.matched_recv,
                     report.matched_drop,
+                    report.resolved_lineage_parents,
+                    report.external_lineage_parents,
                     report.external_inbound,
                     report.external_outbound
                 );
@@ -1103,7 +1541,8 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_lineage_index, summarize_lineage, verify_cluster, verify_trace, ClusterTrace,
+        build_lineage_index, build_problem_detail, build_verify_diagnostics, summarize_lineage,
+        verify_cluster, verify_trace, ClusterTrace, VerifyReport,
     };
     use runtime::event::{EffectKind, EventKind, FaultAction, TraceEvent};
     use serde_json::json;
@@ -1729,6 +2168,62 @@ mod tests {
     }
 
     #[test]
+    fn verify_allows_same_parent_msg_id_when_parent_node_differs() {
+        let node1 = parse_id("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+        let node2 = parse_id("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+        let actor = parse_id("22222222-2222-2222-2222-222222222222");
+        let msg = parse_id("00000000-0000-0000-0000-000000000010");
+
+        let inbound_payload = json!({
+            "type": "x",
+            "from_node": node2.to_string(),
+            "from_service": "RemoteSvc",
+            "text": "payload",
+            "provenance": {
+                "origin_node": node2.to_string(),
+                "origin_service": "RemoteSvc",
+                "origin_msg_id": msg.to_string(),
+                "parent_node": node1.to_string(),
+                "parent_msg_id": msg.to_string(),
+                "hops": 2
+            }
+        });
+
+        let events = vec![
+            event(
+                0,
+                EventKind::Spawn {
+                    node: node1,
+                    actor,
+                    service: "B".to_string(),
+                },
+            ),
+            event(
+                1,
+                EventKind::NetRecv {
+                    node: node1,
+                    from_node: node2,
+                    to: actor,
+                    msg_id: msg,
+                    payload: inbound_payload,
+                },
+            ),
+            event(
+                2,
+                EventKind::Deliver {
+                    node: node1,
+                    to: actor,
+                    msg_id: msg,
+                },
+            ),
+            effect_observed(3, node1, actor, msg, vec![], vec![]),
+        ];
+
+        let report = verify_trace(&events);
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+    }
+
+    #[test]
     fn lineage_summary_counts_resolved_parent_chain() {
         let node = parse_id("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
         let a = parse_id("11111111-1111-1111-1111-111111111111");
@@ -1969,6 +2464,203 @@ mod tests {
                 .any(|p| p.contains("payload mismatch")),
             "{:?}",
             report.problems
+        );
+    }
+
+    #[test]
+    fn cluster_verify_accepts_cross_node_lineage_parent_resolution() {
+        let n1 = parse_id("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+        let n2 = parse_id("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+        let a = parse_id("11111111-1111-1111-1111-111111111111");
+        let b = parse_id("22222222-2222-2222-2222-222222222222");
+        let parent_msg = parse_id("00000000-0000-0000-0000-000000000001");
+        let child_msg = parse_id("00000000-0000-0000-0000-000000000002");
+
+        let parent_payload = payload_with_provenance(n1, "Gateway", parent_msg, n1, parent_msg, 0);
+        let child_payload = json!({
+            "type": "x",
+            "from_node": n2.to_string(),
+            "from_service": "Echo",
+            "text": "payload",
+            "provenance": {
+                "origin_node": n1.to_string(),
+                "origin_service": "Gateway",
+                "origin_msg_id": parent_msg.to_string(),
+                "parent_node": n1.to_string(),
+                "parent_msg_id": parent_msg.to_string(),
+                "hops": 1
+            }
+        });
+
+        let traces = vec![
+            cluster_trace(
+                "n1.trace",
+                vec![
+                    event(
+                        0,
+                        EventKind::Spawn {
+                            node: n1,
+                            actor: a,
+                            service: "Gateway".to_string(),
+                        },
+                    ),
+                    event(
+                        1,
+                        EventKind::Send {
+                            from: a,
+                            to: a,
+                            msg_id: parent_msg,
+                            payload: parent_payload,
+                        },
+                    ),
+                    event(
+                        2,
+                        EventKind::Deliver {
+                            node: n1,
+                            to: a,
+                            msg_id: parent_msg,
+                        },
+                    ),
+                    net_recv(3, n1, n2, a, child_msg, child_payload.clone()),
+                    event(
+                        4,
+                        EventKind::Deliver {
+                            node: n1,
+                            to: a,
+                            msg_id: child_msg,
+                        },
+                    ),
+                ],
+            ),
+            cluster_trace(
+                "n2.trace",
+                vec![
+                    event(
+                        0,
+                        EventKind::Spawn {
+                            node: n2,
+                            actor: b,
+                            service: "Echo".to_string(),
+                        },
+                    ),
+                    net_send(1, n2, n1, b, child_msg, child_payload),
+                ],
+            ),
+        ];
+
+        let report = verify_cluster(&traces);
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        assert_eq!(report.matched_recv, 1);
+        assert_eq!(report.resolved_lineage_parents, 1);
+    }
+
+    #[test]
+    fn cluster_verify_rejects_missing_in_cluster_lineage_parent() {
+        let n1 = parse_id("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+        let n2 = parse_id("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+        let a = parse_id("11111111-1111-1111-1111-111111111111");
+        let b = parse_id("22222222-2222-2222-2222-222222222222");
+        let missing_parent_msg = parse_id("00000000-0000-0000-0000-000000000001");
+        let child_msg = parse_id("00000000-0000-0000-0000-000000000002");
+
+        let child_payload = json!({
+            "type": "x",
+            "from_node": n2.to_string(),
+            "from_service": "Echo",
+            "text": "payload",
+            "provenance": {
+                "origin_node": n1.to_string(),
+                "origin_service": "Gateway",
+                "origin_msg_id": missing_parent_msg.to_string(),
+                "parent_node": n1.to_string(),
+                "parent_msg_id": missing_parent_msg.to_string(),
+                "hops": 1
+            }
+        });
+
+        let traces = vec![
+            cluster_trace(
+                "n1.trace",
+                vec![
+                    event(
+                        0,
+                        EventKind::Spawn {
+                            node: n1,
+                            actor: a,
+                            service: "Gateway".to_string(),
+                        },
+                    ),
+                    net_recv(1, n1, n2, a, child_msg, child_payload.clone()),
+                    event(
+                        2,
+                        EventKind::Deliver {
+                            node: n1,
+                            to: a,
+                            msg_id: child_msg,
+                        },
+                    ),
+                ],
+            ),
+            cluster_trace(
+                "n2.trace",
+                vec![
+                    event(
+                        0,
+                        EventKind::Spawn {
+                            node: n2,
+                            actor: b,
+                            service: "Echo".to_string(),
+                        },
+                    ),
+                    net_send(1, n2, n1, b, child_msg, child_payload),
+                ],
+            ),
+        ];
+
+        let report = verify_cluster(&traces);
+        assert!(
+            report
+                .problems
+                .iter()
+                .any(|p| p.contains("missing in-cluster parent")),
+            "{:?}",
+            report.problems
+        );
+    }
+
+    #[test]
+    fn problem_detail_extracts_invariant_context() {
+        let msg = "Deliver at seq 42 without prior Send/NetRecv for to=22222222-2222-2222-2222-222222222222, msg_id=00000000-0000-0000-0000-000000000010";
+        let detail = build_problem_detail(msg);
+        assert_eq!(detail.code, "deliver_without_source");
+        assert_eq!(detail.seq, Some(42));
+        assert_eq!(
+            detail.msg_id.as_deref(),
+            Some("00000000-0000-0000-0000-000000000010")
+        );
+        assert_eq!(
+            detail.actor.as_deref(),
+            Some("22222222-2222-2222-2222-222222222222")
+        );
+    }
+
+    #[test]
+    fn verify_diagnostics_includes_first_issue() {
+        let report = VerifyReport {
+            problems: vec![
+                "seq mismatch: expected 1, got 2".to_string(),
+                "seed mismatch at seq 3: expected 7, got 8".to_string(),
+            ],
+            pending_messages: 5,
+        };
+
+        let diagnostics = build_verify_diagnostics("trace.jsonl", &report);
+        assert!(!diagnostics.ok);
+        assert_eq!(diagnostics.issue_count, 2);
+        assert_eq!(diagnostics.pending_messages, 5);
+        assert_eq!(
+            diagnostics.first_issue.as_ref().map(|p| p.code),
+            Some("trace_seq_mismatch")
         );
     }
 }

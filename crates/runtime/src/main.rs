@@ -25,11 +25,100 @@ enum Mode {
     Replay,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FaultPolicy {
+    drop_every: Option<u64>,
+    delay_steps: u64,
+    reorder_window: usize,
+}
+
+impl Default for FaultPolicy {
+    fn default() -> Self {
+        Self {
+            drop_every: None,
+            delay_steps: 0,
+            reorder_window: 1,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FaultPhase {
+    start_step: u64,
+    end_step: Option<u64>,
+    policy: FaultPolicy,
+}
+
+impl FaultPhase {
+    fn is_active(&self, step: u64) -> bool {
+        if step < self.start_step {
+            return false;
+        }
+        match self.end_step {
+            Some(end) => step <= end,
+            None => true,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 struct FaultConfig {
     drop_every: Option<u64>,
     delay_steps: u64,
     reorder_window: usize,
+    phases: Vec<FaultPhase>,
+}
+
+impl FaultConfig {
+    fn base_policy(&self) -> FaultPolicy {
+        FaultPolicy {
+            drop_every: self.drop_every,
+            delay_steps: self.delay_steps,
+            reorder_window: self.reorder_window,
+        }
+    }
+
+    fn policy_for_step(&self, step: u64) -> FaultPolicy {
+        let mut policy = self.base_policy();
+        for phase in &self.phases {
+            if phase.is_active(step) {
+                policy = phase.policy;
+            }
+        }
+        policy
+    }
+
+    fn sort_and_validate_phases(&mut self) -> Result<()> {
+        self.phases.sort_by_key(|p| p.start_step);
+
+        let mut prev_end: Option<u64> = None;
+        for (idx, phase) in self.phases.iter().enumerate() {
+            if let Some(end) = phase.end_step {
+                if end < phase.start_step {
+                    anyhow::bail!(
+                        "fault phase #{idx} has end_step < start_step (start={} end={})",
+                        phase.start_step,
+                        end
+                    );
+                }
+            }
+            if let Some(end) = prev_end {
+                if phase.start_step <= end {
+                    anyhow::bail!(
+                        "fault phases overlap at step {} (previous ended at {})",
+                        phase.start_step,
+                        end
+                    );
+                }
+            }
+            if prev_end.is_none() && idx > 0 {
+                anyhow::bail!("fault phase with open-ended range must be last");
+            }
+            prev_end = phase.end_step;
+        }
+
+        Ok(())
+    }
 }
 
 impl Default for FaultConfig {
@@ -38,6 +127,7 @@ impl Default for FaultConfig {
             drop_every: None,
             delay_steps: 0,
             reorder_window: 1,
+            phases: Vec::new(),
         }
     }
 }
@@ -125,6 +215,7 @@ fn print_usage() {
     eprintln!("  --fault-drop-every <n>      Drop every n-th inbound wire message");
     eprintln!("  --fault-delay-steps <n>     Delay inbound wire messages by n runtime steps");
     eprintln!("  --fault-reorder-window <n>  Reverse inbound arrivals in chunks of n");
+    eprintln!("  --fault-phase <s:e:d:l:r>   Override faults for steps [s..e] (e may be *), drop=d, delay=l, reorder=r");
 }
 
 fn parse_peer_spec(spec: &str) -> Result<(Uuid, String)> {
@@ -133,6 +224,59 @@ fn parse_peer_spec(spec: &str) -> Result<(Uuid, String)> {
         .with_context(|| format!("invalid peer format `{spec}`, expected <uuid=host:port>"))?;
     let node = Uuid::parse_str(node).with_context(|| format!("invalid peer node id `{node}`"))?;
     Ok((node, addr.to_string()))
+}
+
+fn parse_fault_phase_spec(spec: &str) -> Result<FaultPhase> {
+    let parts: Vec<&str> = spec.split(':').collect();
+    if parts.len() != 5 {
+        anyhow::bail!(
+            "invalid --fault-phase `{spec}`; expected <start:end:drop_every:delay_steps:reorder_window>"
+        );
+    }
+
+    let start_step = parts[0]
+        .parse::<u64>()
+        .with_context(|| format!("invalid --fault-phase start step `{}`", parts[0]))?;
+
+    let end_step = if parts[1] == "*" {
+        None
+    } else {
+        Some(
+            parts[1]
+                .parse::<u64>()
+                .with_context(|| format!("invalid --fault-phase end step `{}`", parts[1]))?,
+        )
+    };
+
+    let drop_every_raw = parts[2]
+        .parse::<u64>()
+        .with_context(|| format!("invalid --fault-phase drop_every `{}`", parts[2]))?;
+    let drop_every = if drop_every_raw == 0 {
+        None
+    } else {
+        Some(drop_every_raw)
+    };
+
+    let delay_steps = parts[3]
+        .parse::<u64>()
+        .with_context(|| format!("invalid --fault-phase delay_steps `{}`", parts[3]))?;
+
+    let reorder_window = parts[4]
+        .parse::<usize>()
+        .with_context(|| format!("invalid --fault-phase reorder_window `{}`", parts[4]))?;
+    if reorder_window == 0 {
+        anyhow::bail!("--fault-phase reorder_window must be >= 1");
+    }
+
+    Ok(FaultPhase {
+        start_step,
+        end_step,
+        policy: FaultPolicy {
+            drop_every,
+            delay_steps,
+            reorder_window,
+        },
+    })
 }
 
 fn parse_config(args: &[String]) -> Result<Config> {
@@ -257,10 +401,18 @@ fn parse_config(args: &[String]) -> Result<Config> {
                 }
                 fault.reorder_window = parsed;
             }
+            "--fault-phase" => {
+                i += 1;
+                let value = args.get(i).context("missing value for --fault-phase")?;
+                let phase = parse_fault_phase_spec(value)?;
+                fault.phases.push(phase);
+            }
             other => anyhow::bail!("unknown argument: {other}"),
         }
         i += 1;
     }
+
+    fault.sort_and_validate_phases()?;
 
     Ok(Config {
         mode,
@@ -1037,6 +1189,8 @@ struct PendingTimer {
 struct FaultInjector {
     cfg: FaultConfig,
     seen_inbound: u64,
+    active_policy: FaultPolicy,
+    policy_initialized: bool,
     reorder_buf: Vec<StagedInbound>,
     pending: VecDeque<StagedInbound>,
 }
@@ -1044,11 +1198,66 @@ struct FaultInjector {
 impl FaultInjector {
     fn new(cfg: FaultConfig) -> Self {
         Self {
+            active_policy: cfg.policy_for_step(0),
             cfg,
             seen_inbound: 0,
+            policy_initialized: false,
             reorder_buf: Vec::new(),
             pending: VecDeque::new(),
         }
+    }
+
+    fn record_policy_event(
+        &self,
+        step: u64,
+        node_id: Uuid,
+        seq: &mut u64,
+        seed: u64,
+        writer: &mut Option<TraceWriter>,
+    ) -> Result<()> {
+        record_event(
+            writer,
+            seq,
+            seed,
+            EventKind::FaultPolicy {
+                node: node_id,
+                step,
+                drop_every: self.active_policy.drop_every,
+                delay_steps: self.active_policy.delay_steps,
+                reorder_window: self.active_policy.reorder_window as u64,
+            },
+        )
+    }
+
+    fn sync_policy(
+        &mut self,
+        current_step: u64,
+        node_id: Uuid,
+        seq: &mut u64,
+        seed: u64,
+        writer: &mut Option<TraceWriter>,
+    ) -> Result<()> {
+        if !self.policy_initialized {
+            self.active_policy = self.cfg.policy_for_step(current_step);
+            self.record_policy_event(current_step, node_id, seq, seed, writer)?;
+            self.policy_initialized = true;
+            return Ok(());
+        }
+
+        let next_policy = self.cfg.policy_for_step(current_step);
+        if next_policy == self.active_policy {
+            return Ok(());
+        }
+        self.flush_remainder_with_window(
+            node_id,
+            seq,
+            seed,
+            writer,
+            self.active_policy.reorder_window,
+        )?;
+        self.active_policy = next_policy;
+        self.record_policy_event(current_step, node_id, seq, seed, writer)?;
+        Ok(())
     }
 
     fn ingest(
@@ -1060,8 +1269,10 @@ impl FaultInjector {
         seed: u64,
         writer: &mut Option<TraceWriter>,
     ) -> Result<()> {
+        self.sync_policy(current_step, node_id, seq, seed, writer)?;
+
         self.seen_inbound += 1;
-        if let Some(drop_every) = self.cfg.drop_every {
+        if let Some(drop_every) = self.active_policy.drop_every {
             if drop_every > 0 && self.seen_inbound % drop_every == 0 {
                 record_event(
                     writer,
@@ -1080,11 +1291,11 @@ impl FaultInjector {
         }
 
         let staged = StagedInbound {
-            release_step: current_step.saturating_add(self.cfg.delay_steps),
+            release_step: current_step.saturating_add(self.active_policy.delay_steps),
             env,
         };
 
-        if self.cfg.delay_steps > 0 {
+        if self.active_policy.delay_steps > 0 {
             record_event(
                 writer,
                 seq,
@@ -1095,20 +1306,26 @@ impl FaultInjector {
                     to: staged.env.to_actor,
                     msg_id: staged.env.msg_id,
                     action: FaultAction::Delay {
-                        steps: self.cfg.delay_steps,
+                        steps: self.active_policy.delay_steps,
                     },
                 },
             )?;
         }
 
-        if self.cfg.reorder_window <= 1 {
+        if self.active_policy.reorder_window <= 1 {
             self.pending.push_back(staged);
             return Ok(());
         }
 
         self.reorder_buf.push(staged);
-        while self.reorder_buf.len() >= self.cfg.reorder_window {
-            self.flush_chunk(node_id, seq, seed, writer)?;
+        while self.reorder_buf.len() >= self.active_policy.reorder_window {
+            self.flush_chunk(
+                node_id,
+                seq,
+                seed,
+                writer,
+                self.active_policy.reorder_window,
+            )?;
         }
         Ok(())
     }
@@ -1119,12 +1336,13 @@ impl FaultInjector {
         seq: &mut u64,
         seed: u64,
         writer: &mut Option<TraceWriter>,
+        reorder_window: usize,
     ) -> Result<()> {
         if self.reorder_buf.is_empty() {
             return Ok(());
         }
 
-        let take = self.cfg.reorder_window.min(self.reorder_buf.len());
+        let take = reorder_window.min(self.reorder_buf.len());
         let mut chunk: Vec<StagedInbound> = self.reorder_buf.drain(0..take).collect();
 
         if chunk.len() > 1 {
@@ -1139,7 +1357,7 @@ impl FaultInjector {
                         to: staged.env.to_actor,
                         msg_id: staged.env.msg_id,
                         action: FaultAction::Reorder {
-                            window: self.cfg.reorder_window as u64,
+                            window: reorder_window as u64,
                         },
                     },
                 )?;
@@ -1160,13 +1378,30 @@ impl FaultInjector {
         seed: u64,
         writer: &mut Option<TraceWriter>,
     ) -> Result<()> {
-        if self.cfg.reorder_window <= 1 {
+        self.flush_remainder_with_window(
+            node_id,
+            seq,
+            seed,
+            writer,
+            self.active_policy.reorder_window,
+        )
+    }
+
+    fn flush_remainder_with_window(
+        &mut self,
+        node_id: Uuid,
+        seq: &mut u64,
+        seed: u64,
+        writer: &mut Option<TraceWriter>,
+        reorder_window: usize,
+    ) -> Result<()> {
+        if reorder_window <= 1 {
             return Ok(());
         }
         if self.reorder_buf.is_empty() {
             return Ok(());
         }
-        self.flush_chunk(node_id, seq, seed, writer)
+        self.flush_chunk(node_id, seq, seed, writer, reorder_window)
     }
 
     fn release_due(&mut self, current_step: u64) -> Vec<WireEnvelope> {
@@ -1192,6 +1427,8 @@ fn drain_network(
     writer: &mut Option<TraceWriter>,
     injector: &mut FaultInjector,
 ) -> Result<()> {
+    injector.sync_policy(current_step, node_id, seq, seed, writer)?;
+
     loop {
         let env = match rx.try_recv() {
             Ok(env) => env,
@@ -1270,7 +1507,10 @@ impl ReplayCursor {
 fn next_replay_delivery(
     replay: &mut ReplayCursor,
     sys: &mut ActorSystem,
-    node_id: Uuid,
+    cfg: &Config,
+    service_to_actor: &HashMap<String, Uuid>,
+    msg_counter: &mut u64,
+    pending_timers: &mut Vec<PendingTimer>,
 ) -> Result<Option<PendingDelivery>> {
     loop {
         let Some(ev) = replay.next()? else {
@@ -1285,37 +1525,150 @@ fn next_replay_delivery(
                 payload,
                 ..
             } => {
-                if node == node_id {
-                    if let Some(actor) = sys.actors.get_mut(&to) {
-                        actor.inbox.push_back((msg_id, payload));
-                    } else {
-                        eprintln!(
-                            "[{}] replay dropped NetRecv for unknown actor {}",
-                            node_id, to
-                        );
-                    }
-                }
+                inject_replay_netrecv(sys, cfg.node_id, node, to, msg_id, payload);
             }
             EventKind::Deliver { node, to, msg_id } => {
-                if node == node_id {
+                if node == cfg.node_id {
                     return Ok(Some(PendingDelivery { node, to, msg_id }));
                 }
             }
-            EventKind::FaultInjected { .. } => {}
+            EventKind::FaultInjected { .. } | EventKind::FaultPolicy { .. } => {}
+            EventKind::TimerFired {
+                node,
+                from,
+                timer_id,
+            } => {
+                replay_fire_timer(
+                    replay,
+                    sys,
+                    cfg,
+                    service_to_actor,
+                    msg_counter,
+                    pending_timers,
+                    node,
+                    from,
+                    timer_id,
+                )?;
+            }
             EventKind::Send { .. }
             | EventKind::NetSend { .. }
             | EventKind::Spawn { .. }
-            | EventKind::TimerFired { .. }
             | EventKind::Log { .. }
             | EventKind::EffectObserved { .. } => {
                 anyhow::bail!(
                     "[{}] replay encountered unexpected emitted event while awaiting delivery: {:?}",
-                    node_id,
+                    cfg.node_id,
                     ev.kind
                 );
             }
         }
     }
+}
+
+fn inject_replay_netrecv(
+    sys: &mut ActorSystem,
+    node_id: Uuid,
+    node: Uuid,
+    to: Uuid,
+    msg_id: Uuid,
+    payload: serde_json::Value,
+) {
+    if node == node_id {
+        if let Some(actor) = sys.actors.get_mut(&to) {
+            actor.inbox.push_back((msg_id, payload));
+        } else {
+            eprintln!(
+                "[{}] replay dropped NetRecv for unknown actor {}",
+                node_id, to
+            );
+        }
+    }
+}
+
+fn drain_replay_inbound(
+    replay: &mut ReplayCursor,
+    sys: &mut ActorSystem,
+    node_id: Uuid,
+) -> Result<()> {
+    loop {
+        let Some(ev) = replay.next()? else {
+            return Ok(());
+        };
+
+        match ev.kind {
+            EventKind::NetRecv {
+                node,
+                to,
+                msg_id,
+                payload,
+                ..
+            } => {
+                inject_replay_netrecv(sys, node_id, node, to, msg_id, payload);
+            }
+            EventKind::FaultInjected { .. } | EventKind::FaultPolicy { .. } => {}
+            _ => {
+                replay.unread(ev);
+                return Ok(());
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replay_fire_timer(
+    replay: &mut ReplayCursor,
+    sys: &mut ActorSystem,
+    cfg: &Config,
+    service_to_actor: &HashMap<String, Uuid>,
+    msg_counter: &mut u64,
+    pending_timers: &mut Vec<PendingTimer>,
+    node: Uuid,
+    from: Uuid,
+    timer_id: Uuid,
+) -> Result<()> {
+    if node != cfg.node_id {
+        return Ok(());
+    }
+
+    let timer_idx = pending_timers
+        .iter()
+        .position(|t| t.timer_id == timer_id && t.from_actor == from)
+        .with_context(|| {
+            format!(
+                "[{}] replay TimerFired referenced unknown pending timer {}",
+                cfg.node_id, timer_id
+            )
+        })?;
+    let timer = pending_timers.swap_remove(timer_idx);
+
+    let emit_ev = dispatch_outgoing(
+        cfg,
+        sys,
+        service_to_actor,
+        timer.from_actor,
+        timer.target,
+        timer.payload,
+        msg_counter,
+        cfg.mode,
+    )?;
+
+    let actual = replay.next()?.with_context(|| {
+        format!(
+            "[{}] replay trace ended after TimerFired {} while expecting emitted event {:?}",
+            cfg.node_id, timer_id, emit_ev
+        )
+    })?;
+    if actual.kind != emit_ev {
+        anyhow::bail!(
+            "[{}] replay timer emission mismatch for timer {}: expected {:?}, got {:?}",
+            cfg.node_id,
+            timer_id,
+            emit_ev,
+            actual.kind
+        );
+    }
+
+    Ok(())
 }
 
 fn verify_replay_emits(
@@ -1452,7 +1805,7 @@ fn main() -> Result<()> {
         Mode::Replay => Some(ReplayCursor::open(&cfg.trace_path)?),
         Mode::Record => None,
     };
-    let mut injector = FaultInjector::new(cfg.fault);
+    let mut injector = FaultInjector::new(cfg.fault.clone());
 
     let (net_tx, net_rx) = mpsc::channel::<WireEnvelope>();
     let _listener_handle = match (cfg.mode, cfg.listen.clone()) {
@@ -1520,53 +1873,47 @@ fn main() -> Result<()> {
                 &mut injector,
             )?;
         }
-
-        let mut remaining_timers = Vec::with_capacity(pending_timers.len());
-        let mut due_timers = Vec::new();
-        for timer in pending_timers.drain(..) {
-            if timer.due_step <= step {
-                due_timers.push(timer);
-            } else {
-                remaining_timers.push(timer);
-            }
-        }
-        pending_timers = remaining_timers;
-        due_timers.sort_by_key(|t| t.timer_id);
-
-        let mut replay_expected_timers = Vec::new();
-        for timer in due_timers {
-            let timer_ev = EventKind::TimerFired {
-                node: cfg.node_id,
-                from: timer.from_actor,
-                timer_id: timer.timer_id,
-            };
-            match cfg.mode {
-                Mode::Record => record_event(&mut writer, &mut seq, seed, timer_ev)?,
-                Mode::Replay => replay_expected_timers.push(timer_ev),
-            }
-
-            let emit_ev = dispatch_outgoing(
-                &cfg,
-                &mut sys,
-                &service_to_actor,
-                timer.from_actor,
-                timer.target,
-                timer.payload,
-                &mut msg_counter,
-                cfg.mode,
-            )?;
-
-            match cfg.mode {
-                Mode::Record => record_event(&mut writer, &mut seq, seed, emit_ev)?,
-                Mode::Replay => replay_expected_timers.push(emit_ev),
-            }
-        }
-
         if let Mode::Replay = cfg.mode {
             let replay = replay
                 .as_mut()
                 .context("internal error: replay mode without replay cursor")?;
-            verify_replay_emits(replay, cfg.node_id, &replay_expected_timers)?;
+            drain_replay_inbound(replay, &mut sys, cfg.node_id)?;
+        }
+
+        if let Mode::Record = cfg.mode {
+            let mut remaining_timers = Vec::with_capacity(pending_timers.len());
+            let mut due_timers = Vec::new();
+            for timer in pending_timers.drain(..) {
+                if timer.due_step <= step {
+                    due_timers.push(timer);
+                } else {
+                    remaining_timers.push(timer);
+                }
+            }
+            pending_timers = remaining_timers;
+            due_timers.sort_by_key(|t| t.timer_id);
+
+            for timer in due_timers {
+                let timer_ev = EventKind::TimerFired {
+                    node: cfg.node_id,
+                    from: timer.from_actor,
+                    timer_id: timer.timer_id,
+                };
+                record_event(&mut writer, &mut seq, seed, timer_ev)?;
+
+                let emit_ev = dispatch_outgoing(
+                    &cfg,
+                    &mut sys,
+                    &service_to_actor,
+                    timer.from_actor,
+                    timer.target,
+                    timer.payload,
+                    &mut msg_counter,
+                    cfg.mode,
+                )?;
+
+                record_event(&mut writer, &mut seq, seed, emit_ev)?;
+            }
         }
 
         let mut pending = Vec::new();
@@ -1586,7 +1933,14 @@ fn main() -> Result<()> {
                 let replay = replay
                     .as_mut()
                     .context("internal error: replay mode without replay cursor")?;
-                next_replay_delivery(replay, &mut sys, cfg.node_id)?
+                next_replay_delivery(
+                    replay,
+                    &mut sys,
+                    &cfg,
+                    &service_to_actor,
+                    &mut msg_counter,
+                    &mut pending_timers,
+                )?
             }
         };
 
@@ -1770,6 +2124,8 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     use crate::actor::Target;
+    use std::collections::VecDeque;
+    use std::path::Path;
 
     fn test_message(msg_type: &str, text: &str) -> RuntimeMessage {
         RuntimeMessage {
@@ -1796,6 +2152,731 @@ mod tests {
             service_initial_state: HashMap::new(),
             handlers,
         }
+    }
+
+    fn write_trace(path: &Path, events: &[EventKind]) {
+        let mut writer = TraceWriter::create(path).expect("create temp trace");
+        for (idx, kind) in events.iter().cloned().enumerate() {
+            writer
+                .write(&TraceEvent {
+                    seq: idx as u64,
+                    seed: 12345,
+                    kind,
+                })
+                .expect("write trace event");
+        }
+        writer.flush().expect("flush trace");
+    }
+
+    fn replay_test_config(node_id: Uuid) -> Config {
+        Config {
+            mode: Mode::Replay,
+            trace_path: String::new(),
+            program_path: "programs/distributed_services.uco".to_string(),
+            node_id,
+            listen: None,
+            peers: HashMap::new(),
+            bootstrap_hello: false,
+            bootstrap_burst: 1,
+            steps: 10,
+            idle_sleep_ms: 0,
+            startup_wait_ms: 0,
+            fault: FaultConfig::default(),
+        }
+    }
+
+    #[test]
+    fn parses_fault_phase_spec_with_open_end() {
+        let phase = parse_fault_phase_spec("10:*:3:2:4").expect("phase should parse");
+        assert_eq!(phase.start_step, 10);
+        assert_eq!(phase.end_step, None);
+        assert_eq!(
+            phase.policy,
+            FaultPolicy {
+                drop_every: Some(3),
+                delay_steps: 2,
+                reorder_window: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn fault_config_policy_prefers_active_phase() {
+        let mut cfg = FaultConfig {
+            drop_every: None,
+            delay_steps: 0,
+            reorder_window: 1,
+            phases: vec![
+                FaultPhase {
+                    start_step: 5,
+                    end_step: Some(9),
+                    policy: FaultPolicy {
+                        drop_every: Some(2),
+                        delay_steps: 1,
+                        reorder_window: 2,
+                    },
+                },
+                FaultPhase {
+                    start_step: 10,
+                    end_step: None,
+                    policy: FaultPolicy {
+                        drop_every: Some(4),
+                        delay_steps: 3,
+                        reorder_window: 3,
+                    },
+                },
+            ],
+        };
+        cfg.sort_and_validate_phases()
+            .expect("non-overlapping phases should validate");
+
+        assert_eq!(cfg.policy_for_step(0).drop_every, None);
+        assert_eq!(cfg.policy_for_step(6).drop_every, Some(2));
+        assert_eq!(cfg.policy_for_step(10).drop_every, Some(4));
+        assert_eq!(cfg.policy_for_step(99).delay_steps, 3);
+    }
+
+    #[test]
+    fn fault_config_rejects_overlapping_phases() {
+        let mut cfg = FaultConfig {
+            drop_every: None,
+            delay_steps: 0,
+            reorder_window: 1,
+            phases: vec![
+                FaultPhase {
+                    start_step: 0,
+                    end_step: Some(5),
+                    policy: FaultPolicy {
+                        drop_every: Some(2),
+                        delay_steps: 1,
+                        reorder_window: 2,
+                    },
+                },
+                FaultPhase {
+                    start_step: 5,
+                    end_step: Some(10),
+                    policy: FaultPolicy {
+                        drop_every: Some(3),
+                        delay_steps: 1,
+                        reorder_window: 2,
+                    },
+                },
+            ],
+        };
+
+        let err = cfg
+            .sort_and_validate_phases()
+            .expect_err("overlap should fail validation");
+        let err_text = format!("{err:#}");
+        assert!(err_text.contains("overlap"), "unexpected error: {err_text}");
+    }
+
+    #[test]
+    fn replay_delivery_handles_timerfired_before_deliver() {
+        let node = Uuid::parse_str("00000000-0000-0000-0000-000000000501").expect("valid node");
+        let gateway = Uuid::parse_str("965e1b02-03eb-56fe-b20e-3a4852a7eb2c").expect("valid actor");
+        let timer_id =
+            Uuid::parse_str("00000001-0000-0000-0000-000000000501").expect("valid timer");
+
+        let payload = encode_msg(&RuntimeMessage {
+            msg_type: "hello".to_string(),
+            from_node: node.to_string(),
+            from_service: "Gateway".to_string(),
+            text: "timer hello".to_string(),
+            provenance: None,
+        });
+
+        let mut counter_for_expected = 1;
+        let expected_msg_id = next_deterministic_msg_id(node, &mut counter_for_expected);
+
+        let tmp =
+            std::env::temp_dir().join(format!("uco-replay-timer-{}.trace.jsonl", Uuid::new_v4()));
+        write_trace(
+            &tmp,
+            &[
+                EventKind::TimerFired {
+                    node,
+                    from: gateway,
+                    timer_id,
+                },
+                EventKind::Send {
+                    from: gateway,
+                    to: gateway,
+                    msg_id: expected_msg_id,
+                    payload: payload.clone(),
+                },
+                EventKind::Deliver {
+                    node,
+                    to: gateway,
+                    msg_id: expected_msg_id,
+                },
+            ],
+        );
+
+        let mut replay = ReplayCursor::open(tmp.to_str().expect("temp path should be utf8"))
+            .expect("open replay cursor");
+        let mut sys = ActorSystem::new();
+        sys.actors.insert(
+            gateway,
+            Actor {
+                id: gateway,
+                service: "Gateway".to_string(),
+                state: HashMap::new(),
+                inbox: VecDeque::new(),
+            },
+        );
+        let service_to_actor = HashMap::from([(String::from("Gateway"), gateway)]);
+        let mut pending_timers = vec![PendingTimer {
+            due_step: 0,
+            timer_id,
+            from_actor: gateway,
+            target: Target::LocalService("Gateway".to_string()),
+            payload,
+        }];
+        let mut msg_counter = 1;
+        let cfg = replay_test_config(node);
+
+        let next = next_replay_delivery(
+            &mut replay,
+            &mut sys,
+            &cfg,
+            &service_to_actor,
+            &mut msg_counter,
+            &mut pending_timers,
+        )
+        .expect("replay should progress")
+        .expect("expected delivery");
+
+        assert_eq!(next.node, node);
+        assert_eq!(next.to, gateway);
+        assert_eq!(next.msg_id, expected_msg_id);
+        assert!(pending_timers.is_empty());
+        assert_eq!(msg_counter, 2);
+
+        let actor = sys.actors.get(&gateway).expect("gateway exists");
+        let (front_msg_id, _) = actor.inbox.front().expect("timer emission enqueued");
+        assert_eq!(*front_msg_id, expected_msg_id);
+
+        let none = next_replay_delivery(
+            &mut replay,
+            &mut sys,
+            &cfg,
+            &service_to_actor,
+            &mut msg_counter,
+            &mut pending_timers,
+        )
+        .expect("second replay call should succeed");
+        assert!(none.is_none());
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn drain_replay_inbound_stops_before_non_inbound_event() {
+        let node = Uuid::parse_str("00000000-0000-0000-0000-000000000601").expect("valid node");
+        let from_node =
+            Uuid::parse_str("00000000-0000-0000-0000-000000000602").expect("valid node");
+        let gateway = Uuid::parse_str("965e1b02-03eb-56fe-b20e-3a4852a7eb2c").expect("valid actor");
+        let msg_id = Uuid::parse_str("00000000-0000-0000-0000-000000000777").expect("valid msg");
+        let timer_id =
+            Uuid::parse_str("00000001-0000-0000-0000-000000000601").expect("valid timer");
+        let payload = encode_msg(&test_message("hello", "net"));
+
+        let tmp =
+            std::env::temp_dir().join(format!("uco-replay-inbound-{}.trace.jsonl", Uuid::new_v4()));
+        write_trace(
+            &tmp,
+            &[
+                EventKind::NetRecv {
+                    node,
+                    from_node,
+                    to: gateway,
+                    msg_id,
+                    payload: payload.clone(),
+                },
+                EventKind::TimerFired {
+                    node,
+                    from: gateway,
+                    timer_id,
+                },
+            ],
+        );
+
+        let mut replay = ReplayCursor::open(tmp.to_str().expect("temp path should be utf8"))
+            .expect("open replay cursor");
+        let mut sys = ActorSystem::new();
+        sys.actors.insert(
+            gateway,
+            Actor {
+                id: gateway,
+                service: "Gateway".to_string(),
+                state: HashMap::new(),
+                inbox: VecDeque::new(),
+            },
+        );
+
+        drain_replay_inbound(&mut replay, &mut sys, node).expect("drain inbound should succeed");
+
+        let actor = sys.actors.get(&gateway).expect("gateway exists");
+        let (front_msg_id, _) = actor.inbox.front().expect("netrecv should be enqueued");
+        assert_eq!(*front_msg_id, msg_id);
+
+        let next = replay
+            .next()
+            .expect("read next replay event")
+            .expect("timer event expected");
+        assert_eq!(
+            next.kind,
+            EventKind::TimerFired {
+                node,
+                from: gateway,
+                timer_id
+            }
+        );
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn replay_delivery_handles_multiple_timerfirings_before_deliveries() {
+        let node = Uuid::parse_str("00000000-0000-0000-0000-000000000611").expect("valid node");
+        let gateway = Uuid::parse_str("965e1b02-03eb-56fe-b20e-3a4852a7eb2c").expect("valid actor");
+        let timer1 = Uuid::parse_str("00000001-0000-0000-0000-000000000611").expect("valid timer");
+        let timer2 = Uuid::parse_str("00000001-0000-0000-0000-000000000612").expect("valid timer");
+        let payload1 = encode_msg(&test_message("hello", "timer-1"));
+        let payload2 = encode_msg(&test_message("hello", "timer-2"));
+
+        let mut counter_for_expected = 1;
+        let msg1 = next_deterministic_msg_id(node, &mut counter_for_expected);
+        let msg2 = next_deterministic_msg_id(node, &mut counter_for_expected);
+
+        let tmp = std::env::temp_dir().join(format!(
+            "uco-replay-multi-timer-{}.trace.jsonl",
+            Uuid::new_v4()
+        ));
+        write_trace(
+            &tmp,
+            &[
+                EventKind::TimerFired {
+                    node,
+                    from: gateway,
+                    timer_id: timer1,
+                },
+                EventKind::Send {
+                    from: gateway,
+                    to: gateway,
+                    msg_id: msg1,
+                    payload: payload1.clone(),
+                },
+                EventKind::TimerFired {
+                    node,
+                    from: gateway,
+                    timer_id: timer2,
+                },
+                EventKind::Send {
+                    from: gateway,
+                    to: gateway,
+                    msg_id: msg2,
+                    payload: payload2.clone(),
+                },
+                EventKind::Deliver {
+                    node,
+                    to: gateway,
+                    msg_id: msg1,
+                },
+                EventKind::Deliver {
+                    node,
+                    to: gateway,
+                    msg_id: msg2,
+                },
+            ],
+        );
+
+        let mut replay = ReplayCursor::open(tmp.to_str().expect("temp path should be utf8"))
+            .expect("open replay cursor");
+        let mut sys = ActorSystem::new();
+        sys.actors.insert(
+            gateway,
+            Actor {
+                id: gateway,
+                service: "Gateway".to_string(),
+                state: HashMap::new(),
+                inbox: VecDeque::new(),
+            },
+        );
+        let service_to_actor = HashMap::from([(String::from("Gateway"), gateway)]);
+        let mut pending_timers = vec![
+            PendingTimer {
+                due_step: 0,
+                timer_id: timer1,
+                from_actor: gateway,
+                target: Target::LocalService("Gateway".to_string()),
+                payload: payload1,
+            },
+            PendingTimer {
+                due_step: 0,
+                timer_id: timer2,
+                from_actor: gateway,
+                target: Target::LocalService("Gateway".to_string()),
+                payload: payload2,
+            },
+        ];
+        let mut msg_counter = 1;
+        let cfg = replay_test_config(node);
+
+        let first = next_replay_delivery(
+            &mut replay,
+            &mut sys,
+            &cfg,
+            &service_to_actor,
+            &mut msg_counter,
+            &mut pending_timers,
+        )
+        .expect("first replay delivery")
+        .expect("first delivery present");
+        assert_eq!(first.msg_id, msg1);
+
+        let second = next_replay_delivery(
+            &mut replay,
+            &mut sys,
+            &cfg,
+            &service_to_actor,
+            &mut msg_counter,
+            &mut pending_timers,
+        )
+        .expect("second replay delivery")
+        .expect("second delivery present");
+        assert_eq!(second.msg_id, msg2);
+
+        let actor = sys.actors.get(&gateway).expect("gateway exists");
+        assert_eq!(actor.inbox.len(), 2);
+        let ids: Vec<Uuid> = actor.inbox.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![msg1, msg2]);
+        assert!(pending_timers.is_empty());
+        assert_eq!(msg_counter, 3);
+
+        let none = next_replay_delivery(
+            &mut replay,
+            &mut sys,
+            &cfg,
+            &service_to_actor,
+            &mut msg_counter,
+            &mut pending_timers,
+        )
+        .expect("replay should complete");
+        assert!(none.is_none());
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn replay_delivery_rejects_unknown_timer_id() {
+        let node = Uuid::parse_str("00000000-0000-0000-0000-000000000621").expect("valid node");
+        let gateway = Uuid::parse_str("965e1b02-03eb-56fe-b20e-3a4852a7eb2c").expect("valid actor");
+        let missing_timer =
+            Uuid::parse_str("00000001-0000-0000-0000-000000000621").expect("valid timer");
+        let tmp = std::env::temp_dir().join(format!(
+            "uco-replay-missing-timer-{}.trace.jsonl",
+            Uuid::new_v4()
+        ));
+        write_trace(
+            &tmp,
+            &[EventKind::TimerFired {
+                node,
+                from: gateway,
+                timer_id: missing_timer,
+            }],
+        );
+
+        let mut replay = ReplayCursor::open(tmp.to_str().expect("temp path should be utf8"))
+            .expect("open replay cursor");
+        let mut sys = ActorSystem::new();
+        sys.actors.insert(
+            gateway,
+            Actor {
+                id: gateway,
+                service: "Gateway".to_string(),
+                state: HashMap::new(),
+                inbox: VecDeque::new(),
+            },
+        );
+        let service_to_actor = HashMap::from([(String::from("Gateway"), gateway)]);
+        let mut pending_timers = Vec::new();
+        let mut msg_counter = 1;
+        let cfg = replay_test_config(node);
+
+        let err = next_replay_delivery(
+            &mut replay,
+            &mut sys,
+            &cfg,
+            &service_to_actor,
+            &mut msg_counter,
+            &mut pending_timers,
+        )
+        .expect_err("unknown timer should fail");
+        let err_text = format!("{err:#}");
+        assert!(
+            err_text.contains("unknown pending timer"),
+            "unexpected error: {err_text}"
+        );
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn replay_delivery_handles_mixed_netrecv_and_multi_timer_delayed_ordering() {
+        let node = Uuid::parse_str("00000000-0000-0000-0000-000000000631").expect("valid node");
+        let from1 = Uuid::parse_str("00000000-0000-0000-0000-000000000701").expect("valid node");
+        let from2 = Uuid::parse_str("00000000-0000-0000-0000-000000000702").expect("valid node");
+        let gateway = Uuid::parse_str("965e1b02-03eb-56fe-b20e-3a4852a7eb2c").expect("valid actor");
+        let timer1 = Uuid::parse_str("00000001-0000-0000-0000-000000000631").expect("valid timer");
+        let timer2 = Uuid::parse_str("00000001-0000-0000-0000-000000000632").expect("valid timer");
+        let net_msg1 = Uuid::parse_str("00000000-0000-0000-0000-000000000711").expect("valid msg");
+        let net_msg2 = Uuid::parse_str("00000000-0000-0000-0000-000000000712").expect("valid msg");
+        let net_payload1 = encode_msg(&test_message("hello", "net-1"));
+        let net_payload2 = encode_msg(&test_message("hello", "net-2"));
+        let timer_payload1 = encode_msg(&test_message("hello", "timer-1"));
+        let timer_payload2 = encode_msg(&test_message("hello", "timer-2"));
+
+        let mut counter_for_expected = 1;
+        let timer_msg1 = next_deterministic_msg_id(node, &mut counter_for_expected);
+        let timer_msg2 = next_deterministic_msg_id(node, &mut counter_for_expected);
+
+        let tmp = std::env::temp_dir().join(format!(
+            "uco-replay-interleave-{}.trace.jsonl",
+            Uuid::new_v4()
+        ));
+        write_trace(
+            &tmp,
+            &[
+                EventKind::NetRecv {
+                    node,
+                    from_node: from1,
+                    to: gateway,
+                    msg_id: net_msg1,
+                    payload: net_payload1.clone(),
+                },
+                EventKind::TimerFired {
+                    node,
+                    from: gateway,
+                    timer_id: timer1,
+                },
+                EventKind::Send {
+                    from: gateway,
+                    to: gateway,
+                    msg_id: timer_msg1,
+                    payload: timer_payload1.clone(),
+                },
+                EventKind::NetRecv {
+                    node,
+                    from_node: from2,
+                    to: gateway,
+                    msg_id: net_msg2,
+                    payload: net_payload2.clone(),
+                },
+                EventKind::TimerFired {
+                    node,
+                    from: gateway,
+                    timer_id: timer2,
+                },
+                EventKind::Send {
+                    from: gateway,
+                    to: gateway,
+                    msg_id: timer_msg2,
+                    payload: timer_payload2.clone(),
+                },
+                EventKind::Deliver {
+                    node,
+                    to: gateway,
+                    msg_id: timer_msg1,
+                },
+                EventKind::Deliver {
+                    node,
+                    to: gateway,
+                    msg_id: net_msg1,
+                },
+                EventKind::Deliver {
+                    node,
+                    to: gateway,
+                    msg_id: timer_msg2,
+                },
+                EventKind::Deliver {
+                    node,
+                    to: gateway,
+                    msg_id: net_msg2,
+                },
+            ],
+        );
+
+        let mut replay = ReplayCursor::open(tmp.to_str().expect("temp path should be utf8"))
+            .expect("open replay cursor");
+        let mut sys = ActorSystem::new();
+        sys.actors.insert(
+            gateway,
+            Actor {
+                id: gateway,
+                service: "Gateway".to_string(),
+                state: HashMap::new(),
+                inbox: VecDeque::new(),
+            },
+        );
+        let service_to_actor = HashMap::from([(String::from("Gateway"), gateway)]);
+        let mut pending_timers = vec![
+            PendingTimer {
+                due_step: 0,
+                timer_id: timer1,
+                from_actor: gateway,
+                target: Target::LocalService("Gateway".to_string()),
+                payload: timer_payload1,
+            },
+            PendingTimer {
+                due_step: 0,
+                timer_id: timer2,
+                from_actor: gateway,
+                target: Target::LocalService("Gateway".to_string()),
+                payload: timer_payload2,
+            },
+        ];
+        let mut msg_counter = 1;
+        let cfg = replay_test_config(node);
+
+        let first = next_replay_delivery(
+            &mut replay,
+            &mut sys,
+            &cfg,
+            &service_to_actor,
+            &mut msg_counter,
+            &mut pending_timers,
+        )
+        .expect("first replay delivery")
+        .expect("first delivery present");
+        let second = next_replay_delivery(
+            &mut replay,
+            &mut sys,
+            &cfg,
+            &service_to_actor,
+            &mut msg_counter,
+            &mut pending_timers,
+        )
+        .expect("second replay delivery")
+        .expect("second delivery present");
+        let third = next_replay_delivery(
+            &mut replay,
+            &mut sys,
+            &cfg,
+            &service_to_actor,
+            &mut msg_counter,
+            &mut pending_timers,
+        )
+        .expect("third replay delivery")
+        .expect("third delivery present");
+        let fourth = next_replay_delivery(
+            &mut replay,
+            &mut sys,
+            &cfg,
+            &service_to_actor,
+            &mut msg_counter,
+            &mut pending_timers,
+        )
+        .expect("fourth replay delivery")
+        .expect("fourth delivery present");
+
+        assert_eq!(first.msg_id, timer_msg1);
+        assert_eq!(second.msg_id, net_msg1);
+        assert_eq!(third.msg_id, timer_msg2);
+        assert_eq!(fourth.msg_id, net_msg2);
+
+        let actor = sys.actors.get(&gateway).expect("gateway exists");
+        let ids: Vec<Uuid> = actor.inbox.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![net_msg1, timer_msg1, net_msg2, timer_msg2]);
+        assert!(pending_timers.is_empty());
+        assert_eq!(msg_counter, 3);
+
+        let none = next_replay_delivery(
+            &mut replay,
+            &mut sys,
+            &cfg,
+            &service_to_actor,
+            &mut msg_counter,
+            &mut pending_timers,
+        )
+        .expect("replay should complete");
+        assert!(none.is_none());
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn replay_delivery_rejects_timerfired_not_followed_by_send() {
+        let node = Uuid::parse_str("00000000-0000-0000-0000-000000000641").expect("valid node");
+        let from = Uuid::parse_str("00000000-0000-0000-0000-000000000741").expect("valid node");
+        let gateway = Uuid::parse_str("965e1b02-03eb-56fe-b20e-3a4852a7eb2c").expect("valid actor");
+        let timer = Uuid::parse_str("00000001-0000-0000-0000-000000000641").expect("valid timer");
+        let net_msg = Uuid::parse_str("00000000-0000-0000-0000-000000000742").expect("valid msg");
+        let timer_payload = encode_msg(&test_message("hello", "timer"));
+        let net_payload = encode_msg(&test_message("hello", "net"));
+
+        let tmp = std::env::temp_dir().join(format!(
+            "uco-replay-timer-adj-{}.trace.jsonl",
+            Uuid::new_v4()
+        ));
+        write_trace(
+            &tmp,
+            &[
+                EventKind::TimerFired {
+                    node,
+                    from: gateway,
+                    timer_id: timer,
+                },
+                EventKind::NetRecv {
+                    node,
+                    from_node: from,
+                    to: gateway,
+                    msg_id: net_msg,
+                    payload: net_payload,
+                },
+            ],
+        );
+
+        let mut replay = ReplayCursor::open(tmp.to_str().expect("temp path should be utf8"))
+            .expect("open replay cursor");
+        let mut sys = ActorSystem::new();
+        sys.actors.insert(
+            gateway,
+            Actor {
+                id: gateway,
+                service: "Gateway".to_string(),
+                state: HashMap::new(),
+                inbox: VecDeque::new(),
+            },
+        );
+        let service_to_actor = HashMap::from([(String::from("Gateway"), gateway)]);
+        let mut pending_timers = vec![PendingTimer {
+            due_step: 0,
+            timer_id: timer,
+            from_actor: gateway,
+            target: Target::LocalService("Gateway".to_string()),
+            payload: timer_payload,
+        }];
+        let mut msg_counter = 1;
+        let cfg = replay_test_config(node);
+
+        let err = next_replay_delivery(
+            &mut replay,
+            &mut sys,
+            &cfg,
+            &service_to_actor,
+            &mut msg_counter,
+            &mut pending_timers,
+        )
+        .expect_err("TimerFired without immediate Send should fail");
+        let err_text = format!("{err:#}");
+        assert!(
+            err_text.contains("timer emission mismatch"),
+            "unexpected error: {err_text}"
+        );
+
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
