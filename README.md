@@ -93,12 +93,14 @@ Use this loop for every feature or bug fix:
 12. Machine-readable trend signals (`invariant_trend_signals.ps1`) for bot/dashboard consumers.
 13. Trend notification/export bridge (`invariant_trend_notify.ps1`) with GitHub summary + optional webhook delivery.
 14. Adaptive policy profile resolution from config rules (`profile_resolution` in `configs/invariant-trend-policies.json`).
+15. Policy rule lint gate (`invariant_trend_policy_lint.ps1`) preventing misconfigured profile selection/debt metadata.
+16. Config-declared profile resolution test cases (`profile_resolution.tests`) executed by lint to prevent mapping drift.
 
 ## Next Critical Bricks
 
 1. Adaptive trend gate tuning
 - Add automated debt-window renewal reminders/escalation ownership workflows beyond expiry metadata checks.
-- Add profile selection rule linting/tests to prevent misconfigured branch/run-source mappings.
+- Add policy change approval automation (required reviewers/sign-off for threshold or rule relaxations).
 
 2. Historical analytics depth
 - Add rollup views over history index (moving windows, rate-of-change, failure bursts).
@@ -323,8 +325,9 @@ Local CI runs:
 - partition/churn envelope three-node matrix
 - phased choreography closed three-node matrix
 - invariant trend summary from matrix indexes
+- invariant trend policy lint (profile/rule/debt metadata validation)
 - invariant trend policy gate (profile-driven thresholds with config-based branch/source auto resolution)
-- invariant trend debt-window guard (warnings + branch-aware fail mode for near-expiry windows)
+- invariant trend debt-window guard (warnings + strict-profile fail mode for near-expiry windows)
 - invariant trend history snapshot/index retention
 - invariant trend history analytics
 - invariant trend signals synthesis (machine-readable status for dashboards/bots)
@@ -398,6 +401,12 @@ Enforce trend policy thresholds (absolute + delta):
 pwsh -File scripts/invariant_trend_gate.ps1 -SummaryPath demo-traces/invariant-trends.summary.json -GateReportPath demo-traces/invariant-trends.gate.json -MaxTotalIssues 0 -MaxLocalIssues 0 -MaxClusterIssues 0 -MaxTotalDeltaIncrease 0 -MaxLocalDeltaIncrease 0 -MaxClusterDeltaIncrease 0 -MaxSingleCodeDeltaIncrease 0
 ```
 
+Lint trend policy profile/rule/debt-window configuration:
+
+```bash
+pwsh -File scripts/invariant_trend_policy_lint.ps1 -PolicyFilePath configs/invariant-trend-policies.json -ReportPath demo-traces/invariant-trends.policy-lint.json
+```
+
 Enforce thresholds through a named policy profile:
 
 ```bash
@@ -456,6 +465,7 @@ The matrices write:
 - `demo-traces/invariant-trends.summary.json`
 - `demo-traces/invariant-trends.summary.md`
 - `demo-traces/invariant-trends.gate.json`
+- `demo-traces/invariant-trends.policy-lint.json`
 - `demo-traces/invariant-trends.policy.json`
 - `demo-traces/invariant-trends.debt-windows.json`
 - `demo-traces/invariant-trends.signals.json`
@@ -473,6 +483,7 @@ Each index links scenarios to traces and `--report-json` artifacts and includes:
 All matrix scripts continue through all scenarios, write index artifacts, and then fail if any scenario failed.
 
 CI restores the previous trend summary from a branch-local cache, computes `delta_from_previous`, enforces trend thresholds, appends a bounded trend history snapshot/index, saves the new baseline for the next run, and enforces an artifact storage budget before uploading trace artifacts.
+CI lints profile-resolution/debt-window policy configuration before policy gating.
 CI resolves trend policy profiles from `profile_resolution` branch/source rules, then validates debt-window metadata and expiration; strict profile runs fail when windows are within 7 days of expiry.
 CI also synthesizes invariant trend signals into a compact JSON report for bot/dashboard consumption.
 CI also generates a notification markdown/payload artifact, appends it to GitHub step summary, and can post to a configured webhook via `INVARIANT_TREND_WEBHOOK_URL`.
@@ -498,6 +509,7 @@ All cluster scripts run local `tool verify` on each trace, replay checks (`runti
 - Runtime behavior is executed from the parsed service language, not hardcoded Rust handlers.
 - Trend policy profiles can include optional debt windows with explicit `allow_until_utc`, `owner`, and `tracking_issue` metadata; expired windows fail closed.
 - Trend policy profile selection can be rule-driven (`profile_resolution`) using branch exact/glob/regex plus run source and pull request context.
+- Trend policy lint validates rule/profile references, selector sanity, debt-window metadata, and `profile_resolution.tests` expected mappings before policy gate execution.
 - Generated matrix/trend artifacts under `demo-traces` are gitignored and bounded by `artifact_storage_guard.ps1` plus bounded trend history retention (`invariant_trend_history.ps1`) to prevent repository bloat while preserving source development files.
 
 ## Branch Protection

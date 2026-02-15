@@ -11,6 +11,7 @@ param(
     [switch]$SkipInvariantTrends,
     [switch]$SkipInvariantTrendGate,
     [switch]$SkipInvariantTrendPolicy,
+    [switch]$SkipInvariantTrendPolicyLint,
     [switch]$SkipInvariantTrendDebtWindows,
     [switch]$SkipInvariantTrendHistory,
     [switch]$SkipInvariantTrendAnalytics,
@@ -33,121 +34,134 @@ $env:CARGO_INCREMENTAL = "0"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $repoRoot
 
-Write-Host "[1/20] cargo fmt --check"
+Write-Host "[1/21] cargo fmt --check"
 cargo fmt --all -- --check | Out-Host
 if ($LASTEXITCODE -ne 0) {
     throw "cargo fmt --check failed"
 }
 
-Write-Host "[2/20] cargo check"
+Write-Host "[2/21] cargo check"
 cargo check --workspace --all-targets --locked | Out-Host
 if ($LASTEXITCODE -ne 0) {
     throw "cargo check failed"
 }
 
-Write-Host "[3/20] cargo test"
+Write-Host "[3/21] cargo test"
 cargo test --workspace --locked | Out-Host
 if ($LASTEXITCODE -ne 0) {
     throw "cargo test failed"
 }
 
 if (-not $SkipFaultMatrix) {
-    Write-Host "[4/20] fault matrix"
+    Write-Host "[4/21] fault matrix"
     pwsh -File scripts/fault_matrix.ps1 | Out-Host
     if ($LASTEXITCODE -ne 0) {
         throw "fault matrix failed"
     }
 }
 else {
-    Write-Host "[4/20] fault matrix skipped"
+    Write-Host "[4/21] fault matrix skipped"
 }
 
 if (-not $SkipClusterScenario) {
-    Write-Host "[5/20] cluster scenario"
+    Write-Host "[5/21] cluster scenario"
     pwsh -File scripts/cluster_scenario.ps1 | Out-Host
     if ($LASTEXITCODE -ne 0) {
         throw "cluster scenario failed"
     }
 }
 else {
-    Write-Host "[5/20] cluster scenario skipped"
+    Write-Host "[5/21] cluster scenario skipped"
 }
 
 if (-not $SkipCluster3Scenario) {
-    Write-Host "[6/20] cluster3 scenario"
+    Write-Host "[6/21] cluster3 scenario"
     pwsh -File scripts/cluster3_scenario.ps1 | Out-Host
     if ($LASTEXITCODE -ne 0) {
         throw "cluster3 scenario failed"
     }
 }
 else {
-    Write-Host "[6/20] cluster3 scenario skipped"
+    Write-Host "[6/21] cluster3 scenario skipped"
 }
 
 if (-not $SkipClusterFaultScenario -and -not $SkipClusterFaultMatrix) {
-    Write-Host "[7/20] cluster fault matrix"
+    Write-Host "[7/21] cluster fault matrix"
     pwsh -File scripts/cluster_fault_matrix.ps1 | Out-Host
     if ($LASTEXITCODE -ne 0) {
         throw "cluster fault matrix failed"
     }
 }
 else {
-    Write-Host "[7/20] cluster fault matrix skipped"
+    Write-Host "[7/21] cluster fault matrix skipped"
 }
 
 if (-not $SkipCluster3FaultMatrix) {
-    Write-Host "[8/20] cluster3 fault matrix"
+    Write-Host "[8/21] cluster3 fault matrix"
     pwsh -File scripts/cluster3_fault_matrix.ps1 | Out-Host
     if ($LASTEXITCODE -ne 0) {
         throw "cluster3 fault matrix failed"
     }
 }
 else {
-    Write-Host "[8/20] cluster3 fault matrix skipped"
+    Write-Host "[8/21] cluster3 fault matrix skipped"
 }
 
 if (-not $SkipCluster3MultiFaultMatrix) {
-    Write-Host "[9/20] cluster3 multi-target fault matrix"
+    Write-Host "[9/21] cluster3 multi-target fault matrix"
     pwsh -File scripts/cluster3_multi_fault_matrix.ps1 | Out-Host
     if ($LASTEXITCODE -ne 0) {
         throw "cluster3 multi-target fault matrix failed"
     }
 }
 else {
-    Write-Host "[9/20] cluster3 multi-target fault matrix skipped"
+    Write-Host "[9/21] cluster3 multi-target fault matrix skipped"
 }
 
 if (-not $SkipCluster3EnvelopeFaultMatrix) {
-    Write-Host "[10/20] cluster3 partition/churn envelope matrix"
+    Write-Host "[10/21] cluster3 partition/churn envelope matrix"
     pwsh -File scripts/cluster3_envelope_matrix.ps1 | Out-Host
     if ($LASTEXITCODE -ne 0) {
         throw "cluster3 envelope matrix failed"
     }
 }
 else {
-    Write-Host "[10/20] cluster3 partition/churn envelope matrix skipped"
+    Write-Host "[10/21] cluster3 partition/churn envelope matrix skipped"
 }
 
 if (-not $SkipCluster3ChoreographyFaultMatrix) {
-    Write-Host "[11/20] cluster3 phased choreography matrix"
+    Write-Host "[11/21] cluster3 phased choreography matrix"
     pwsh -File scripts/cluster3_choreography_matrix.ps1 | Out-Host
     if ($LASTEXITCODE -ne 0) {
         throw "cluster3 choreography matrix failed"
     }
 }
 else {
-    Write-Host "[11/20] cluster3 phased choreography matrix skipped"
+    Write-Host "[11/21] cluster3 phased choreography matrix skipped"
 }
 
 if (-not $SkipInvariantTrends) {
-    Write-Host "[12/20] invariant trend summary"
+    Write-Host "[12/21] invariant trend summary"
     pwsh -File scripts/invariant_trends.ps1 | Out-Host
     if ($LASTEXITCODE -ne 0) {
         throw "invariant trend summary failed"
     }
 }
 else {
-    Write-Host "[12/20] invariant trend summary skipped"
+    Write-Host "[12/21] invariant trend summary skipped"
+}
+
+if (-not $SkipInvariantTrendPolicyLint) {
+    Write-Host "[13/21] invariant trend policy lint"
+    pwsh -File scripts/invariant_trend_policy_lint.ps1 `
+        -PolicyFilePath $TrendPolicyFile `
+        -ReportPath demo-traces/invariant-trends.policy-lint.json | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        throw "invariant trend policy lint failed"
+    }
+}
+else {
+    Write-Host "[13/21] invariant trend policy lint skipped"
 }
 
 $branchName = ""
@@ -171,18 +185,18 @@ if (-not $SkipInvariantTrendPolicy -and -not $SkipInvariantTrendGate -and -not $
         $policyArgs["Profile"] = $TrendPolicyProfile
     }
     $profileLabel = if ($policyArgs.ContainsKey("Profile")) { [string]$policyArgs["Profile"] } else { "auto" }
-    Write-Host "[13/20] invariant trend policy gate (profile=$profileLabel)"
+    Write-Host "[14/21] invariant trend policy gate (profile=$profileLabel)"
     pwsh -File scripts/invariant_trend_policy.ps1 @policyArgs | Out-Host
     if ($LASTEXITCODE -ne 0) {
         throw "invariant trend policy gate failed"
     }
 }
 else {
-    Write-Host "[13/20] invariant trend policy gate skipped"
+    Write-Host "[14/21] invariant trend policy gate skipped"
 }
 
 if (-not $SkipInvariantTrendDebtWindows) {
-    Write-Host "[14/20] invariant trend debt-window guard"
+    Write-Host "[15/21] invariant trend debt-window guard"
     $debtWindowArgs = @{
         PolicyFilePath = $TrendPolicyFile
         ReportPath = "demo-traces/invariant-trends.debt-windows.json"
@@ -213,11 +227,11 @@ if (-not $SkipInvariantTrendDebtWindows) {
     }
 }
 else {
-    Write-Host "[14/20] invariant trend debt-window guard skipped"
+    Write-Host "[15/21] invariant trend debt-window guard skipped"
 }
 
 if (-not $SkipInvariantTrendHistory -and -not $SkipInvariantTrends) {
-    Write-Host "[15/20] invariant trend history"
+    Write-Host "[16/21] invariant trend history"
     pwsh -File scripts/invariant_trend_history.ps1 `
         -SummaryPath demo-traces/invariant-trends.summary.json `
         -HistoryDir demo-traces/invariant-history `
@@ -228,11 +242,11 @@ if (-not $SkipInvariantTrendHistory -and -not $SkipInvariantTrends) {
     }
 }
 else {
-    Write-Host "[15/20] invariant trend history skipped"
+    Write-Host "[16/21] invariant trend history skipped"
 }
 
 if (-not $SkipInvariantTrendAnalytics -and -not $SkipInvariantTrends -and -not $SkipInvariantTrendHistory) {
-    Write-Host "[16/20] invariant trend analytics"
+    Write-Host "[17/21] invariant trend analytics"
     pwsh -File scripts/invariant_trend_analytics.ps1 `
         -HistoryIndexPath demo-traces/invariant-history/index.json `
         -AnalyticsPath demo-traces/invariant-history/analytics.json `
@@ -242,11 +256,11 @@ if (-not $SkipInvariantTrendAnalytics -and -not $SkipInvariantTrends -and -not $
     }
 }
 else {
-    Write-Host "[16/20] invariant trend analytics skipped"
+    Write-Host "[17/21] invariant trend analytics skipped"
 }
 
 if (-not $SkipInvariantTrendSignals -and -not $SkipInvariantTrends) {
-    Write-Host "[17/20] invariant trend signals"
+    Write-Host "[18/21] invariant trend signals"
     pwsh -File scripts/invariant_trend_signals.ps1 `
         -SummaryPath demo-traces/invariant-trends.summary.json `
         -GateReportPath demo-traces/invariant-trends.gate.json `
@@ -259,11 +273,11 @@ if (-not $SkipInvariantTrendSignals -and -not $SkipInvariantTrends) {
     }
 }
 else {
-    Write-Host "[17/20] invariant trend signals skipped"
+    Write-Host "[18/21] invariant trend signals skipped"
 }
 
 if (-not $SkipInvariantTrendNotify -and -not $SkipInvariantTrendSignals -and -not $SkipInvariantTrends) {
-    Write-Host "[18/20] invariant trend notify"
+    Write-Host "[19/21] invariant trend notify"
     $notifyArgs = @{
         SignalsPath = "demo-traces/invariant-trends.signals.json"
         SummaryPath = "demo-traces/invariant-trends.summary.json"
@@ -287,24 +301,24 @@ if (-not $SkipInvariantTrendNotify -and -not $SkipInvariantTrendSignals -and -no
     }
 }
 else {
-    Write-Host "[18/20] invariant trend notify skipped"
+    Write-Host "[19/21] invariant trend notify skipped"
 }
 
 if (-not $SkipArtifactStorageGuard) {
-    Write-Host "[19/20] artifact storage guard"
+    Write-Host "[20/21] artifact storage guard"
     pwsh -File scripts/artifact_storage_guard.ps1 -MaxTotalMB 64 -KeepLatest 120 -MinKeep 60 | Out-Host
     if ($LASTEXITCODE -ne 0) {
         throw "artifact storage guard failed"
     }
 }
 else {
-    Write-Host "[19/20] artifact storage guard skipped"
+    Write-Host "[20/21] artifact storage guard skipped"
 }
 
 if (-not $SkipLean) {
     $lakeCmd = Get-Command lake -ErrorAction SilentlyContinue
     if ($null -ne $lakeCmd) {
-        Write-Host "[20/20] lean kernel build"
+        Write-Host "[21/21] lean kernel build"
         Push-Location semantics-lean
         try {
             lake build | Out-Host
@@ -317,11 +331,11 @@ if (-not $SkipLean) {
         }
     }
     else {
-        Write-Host "[20/20] lean kernel build skipped (lake not installed)"
+        Write-Host "[21/21] lean kernel build skipped (lake not installed)"
     }
 }
 else {
-    Write-Host "[20/20] lean kernel build skipped"
+    Write-Host "[21/21] lean kernel build skipped"
 }
 
 Write-Host "Local CI checks passed."

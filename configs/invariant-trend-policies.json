@@ -28,6 +28,71 @@
           "*"
         ]
       }
+    ],
+    "tests": [
+      {
+        "name": "main-local-strict",
+        "branch": "main",
+        "run_source": "local",
+        "is_pull_request": false,
+        "expected_profile": "strict"
+      },
+      {
+        "name": "master-ci-strict",
+        "branch": "master",
+        "run_source": "github-actions",
+        "is_pull_request": false,
+        "expected_profile": "strict"
+      },
+      {
+        "name": "feature-default-development",
+        "branch": "feature/abc",
+        "run_source": "local",
+        "is_pull_request": false,
+        "expected_profile": "development"
+      },
+      {
+        "name": "investigation-branch",
+        "branch": "investigation/replay-mismatch",
+        "run_source": "local",
+        "is_pull_request": false,
+        "expected_profile": "investigation"
+      },
+      {
+        "name": "diagnostic-branch",
+        "branch": "diagnostic/fault-triage",
+        "run_source": "local",
+        "is_pull_request": false,
+        "expected_profile": "investigation"
+      },
+      {
+        "name": "spike-branch",
+        "branch": "spike/queue-stress",
+        "run_source": "local",
+        "is_pull_request": false,
+        "expected_profile": "investigation"
+      },
+      {
+        "name": "hardening-branch",
+        "branch": "hardening/replay-window",
+        "run_source": "github-actions",
+        "is_pull_request": false,
+        "expected_profile": "hardening-window"
+      },
+      {
+        "name": "stabilization-branch",
+        "branch": "stabilization/net-ordering",
+        "run_source": "local",
+        "is_pull_request": false,
+        "expected_profile": "hardening-window"
+      },
+      {
+        "name": "feature-pr-development",
+        "branch": "feature/pr-candidate",
+        "run_source": "github-actions",
+        "is_pull_request": true,
+        "expected_profile": "development"
+      }
     ]
   },
   "profiles": {

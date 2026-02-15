@@ -8,6 +8,7 @@ demo-traces/*.index.json
 demo-traces/invariant-trends.summary.json
 demo-traces/invariant-trends.summary.md
 demo-traces/invariant-trends.gate.json
+demo-traces/invariant-trends.policy-lint.json
 demo-traces/invariant-trends.policy.json
 demo-traces/invariant-trends.policy.*.json
 demo-traces/invariant-trends.debt-windows.json

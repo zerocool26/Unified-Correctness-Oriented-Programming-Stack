@@ -1,6 +1,7 @@
 param(
     [string]$SummaryPath = "demo-traces/invariant-trends.summary.json",
     [string]$GateReportPath = "demo-traces/invariant-trends.gate.json",
+    [string]$PolicyLintReportPath = "demo-traces/invariant-trends.policy-lint.json",
     [string]$PolicyReportPath = "demo-traces/invariant-trends.policy.json",
     [string]$DebtWindowReportPath = "demo-traces/invariant-trends.debt-windows.json",
     [string]$AnalyticsPath = "demo-traces/invariant-history/analytics.json",
@@ -63,6 +64,7 @@ function Read-JsonIfExists {
 $signals = New-Object System.Collections.ArrayList
 $summary = Read-JsonIfExists -Path $SummaryPath
 $gate = Read-JsonIfExists -Path $GateReportPath
+$policyLint = Read-JsonIfExists -Path $PolicyLintReportPath
 $policy = Read-JsonIfExists -Path $PolicyReportPath
 $debtWindows = Read-JsonIfExists -Path $DebtWindowReportPath
 $analytics = Read-JsonIfExists -Path $AnalyticsPath
@@ -104,6 +106,26 @@ else {
     }
     elseif (-not [bool]$gate.has_previous_baseline) {
         Add-Signal -Signals $signals -Severity "info" -Code "missing_previous_baseline" -Message "No previous trend baseline was available for delta comparison."
+    }
+}
+
+if ($null -eq $policyLint) {
+    Add-Signal -Signals $signals -Severity "warn" -Code "missing_policy_lint_report" -Message ("Policy lint report not found: {0}" -f $PolicyLintReportPath)
+}
+else {
+    $lintErrors = Get-SafeInt -Value $policyLint.counts.error
+    $lintWarnings = Get-SafeInt -Value $policyLint.counts.warn
+    if ($lintErrors -gt 0) {
+        Add-Signal -Signals $signals -Severity "error" -Code "policy_lint_errors" -Message ("Policy lint failed with {0} error(s)." -f $lintErrors) -Data @{
+            counts = $policyLint.counts
+            findings = @($policyLint.findings)
+        }
+    }
+    elseif ($lintWarnings -gt 0) {
+        Add-Signal -Signals $signals -Severity "warn" -Code "policy_lint_warnings" -Message ("Policy lint reported {0} warning(s)." -f $lintWarnings) -Data @{
+            counts = $policyLint.counts
+            findings = @($policyLint.findings)
+        }
     }
 }
 
@@ -190,6 +212,7 @@ $signalsReport = [ordered]@{
     source_paths = @{
         summary = $SummaryPath
         gate = $GateReportPath
+        policy_lint = $PolicyLintReportPath
         policy = $PolicyReportPath
         debt_windows = $DebtWindowReportPath
         analytics = $AnalyticsPath

@@ -139,6 +139,14 @@ jobs:
           }
           Copy-Item demo-traces/invariant-trends.summary.json .ci-cache/invariant-trends.prev.json -Force
 
+      - name: Lint invariant trend policy rules
+        if: always()
+        shell: pwsh
+        run: |
+          ./scripts/invariant_trend_policy_lint.ps1 `
+            -PolicyFilePath configs/invariant-trend-policies.json `
+            -ReportPath demo-traces/invariant-trends.policy-lint.json
+
       - name: Enforce invariant trend policy gate
         if: always()
         shell: pwsh
@@ -264,6 +272,7 @@ jobs:
             demo-traces/invariant-trends.summary.json
             demo-traces/invariant-trends.summary.md
             demo-traces/invariant-trends.gate.json
+            demo-traces/invariant-trends.policy-lint.json
             demo-traces/invariant-trends.policy.json
             demo-traces/invariant-trends.debt-windows.json
             demo-traces/invariant-trends.signals.json

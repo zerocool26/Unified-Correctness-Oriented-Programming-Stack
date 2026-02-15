@@ -108,6 +108,7 @@ Guarantees:
 - Lean kernel build.
 - Windows fault and cluster scenarios.
 - Invariant trend summaries are generated and compared against prior baseline snapshots.
+- Trend policy configuration is linted for profile/rule/debt-window correctness before gate execution.
 - Invariant trend gate enforces absolute and delta thresholds in local/CI flows.
 - Trend policy profile selection is rule-driven from branch/source context when profile is not explicitly set.
 - Trend policy profiles support explicit temporary debt windows with expiration metadata and fail-closed expiry behavior.
@@ -194,7 +195,7 @@ When choosing next work, prioritize in this order:
 
 1. Adaptive trend policy profiles
 - Add debt-window renewal reminder/escalation workflows on top of current metadata/expiry enforcement.
-- Add validation/lint checks for profile resolution rules to prevent accidental policy drift.
+- Add policy-change approval automation for threshold/rule relaxation changes.
 
 2. Historical analytics and alerting
 - Build rollup metrics from history (moving windows, slope/drift, failure burst detection).
